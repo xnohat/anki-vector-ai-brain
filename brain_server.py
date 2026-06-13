@@ -536,8 +536,9 @@ def autonomous_loop():
 # Reflex loop — fast sensor reflexes (safety) + event reactions.
 # --------------------------------------------------------------------------- #
 SHAKE_GYRO = float(os.environ.get("VECTOR_SHAKE_GYRO", "8"))
-# Upright accel.z ~ +9400. Tilted >~70deg or upside-down -> z drops below this.
-FLIP_AZ = float(os.environ.get("VECTOR_FLIP_AZ", "3500"))
+# tilt = cos(angle from upright): 1=level, 0=on side, -1=upside down. Trigger a
+# flip/tilt reaction below this (0.85 ~= 32 deg tilt; lower = needs a bigger flip).
+FLIP_TILT = float(os.environ.get("VECTOR_FLIP_TILT", "0.85"))
 EVENT_COOLDOWN = float(os.environ.get("VECTOR_EVENT_COOLDOWN", "6"))
 
 
@@ -552,7 +553,7 @@ def reflex_loop():
             touched, held, button = ROBOT.feel()
             picked = ROBOT.picked_up()
             cliff = ROBOT.cliff()
-            az, gmag, pitch = ROBOT.motion()
+            az, gmag, pitch, tilt = ROBOT.motion()
         except Exception:
             continue
         if button:
@@ -577,7 +578,7 @@ def reflex_loop():
         suppress = (now - _STATE["voice_active"] < VOICE_BACKOFF) or \
                    (now - _STATE.get("button_ts", 0) < 6)
 
-        flipped = az < FLIP_AZ
+        flipped = tilt < FLIP_TILT
         event = None
         allow_move = True
         is_petting = False

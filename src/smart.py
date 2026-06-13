@@ -208,13 +208,15 @@ class SmartVector:
         return s
 
     def motion(self) -> tuple:
-        """Cheap RPC-free (accel_z, gyro_magnitude, pitch_deg) for shake/flip."""
-        az = 0.0
+        """Cheap RPC-free (accel_z, gyro_magnitude, pitch_deg, tilt) for shake/flip.
+        `tilt` is cos(angle from upright): 1.0 = level, 0.0 = on its side,
+        -1.0 = upside down (catches a flip in ANY direction, not just roll)."""
+        ax = ay = az = 0.0
         gmag = 0.0
         pitch = 0.0
         try:
             a = self.robot.accel
-            az = float(a.z)
+            ax, ay, az = float(a.x), float(a.y), float(a.z)
         except Exception:
             pass
         try:
@@ -226,7 +228,9 @@ class SmartVector:
             pitch = self.robot.pose_pitch_rad * 57.3
         except Exception:
             pass
-        return az, gmag, pitch
+        mag = (ax * ax + ay * ay + az * az) ** 0.5 or 1.0
+        tilt = az / mag
+        return az, gmag, pitch, tilt
 
     def cliff(self) -> bool:
         try:
