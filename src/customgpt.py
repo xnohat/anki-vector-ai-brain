@@ -52,7 +52,7 @@ SPEAK_LANG = os.environ.get("VECTOR_LANG", "Vietnamese")
 
 # Keep the rolling conversation from growing without bound. We always keep the
 # system prompt plus the most recent N exchanges.
-MAX_HISTORY_MESSAGES = 24
+MAX_HISTORY_MESSAGES = 40
 
 
 class CustomGPT:
@@ -159,7 +159,7 @@ class CustomGPT:
         call_messages = self.messages
         if memories:
             mem_msg = {"role": "system",
-                       "content": "Ký ức liên quan của bạn (dùng nếu hữu ích):\n" + memories}
+                       "content": "Your relevant memories (use if helpful):\n" + memories}
             call_messages = self.messages[:-1] + [mem_msg] + self.messages[-1:]
 
         try:

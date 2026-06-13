@@ -288,16 +288,36 @@ class SmartVector:
         with self.control():
             _wait(self.robot.behavior.set_lift_height(max(0.0, min(1.0, height))))
 
-    def approach(self) -> None:
-        """Come near the human: face them if seen, then roll closer."""
+    def _visible_faces(self) -> list:
+        try:
+            return [f for f in self.robot.world.visible_faces]
+        except Exception:
+            return []
+
+    def find_caller(self) -> bool:
+        """Turn to find and face the human who called (we have no sound direction,
+        so rotate and look for a face — e.g. person behind -> Vector turns around)."""
         with self.control():
             self._off_charger()
-            try:
-                faces = [f for f in self.robot.world.visible_faces]
-            except Exception:
-                faces = []
+            _wait(self.robot.behavior.set_head_angle(degrees(30)))
+            for _ in range(9):                       # up to ~360 degrees
+                faces = self._visible_faces()
+                if faces:
+                    _wait(self.robot.behavior.turn_towards_face(faces[0]))
+                    return True
+                _wait(self.robot.behavior.turn_in_place(degrees(45)))
+                time.sleep(0.45)                     # let the camera/face detector update
+            return False
+
+    def approach(self) -> None:
+        """Come near the human: find/face them, then roll closer."""
+        with self.control():
+            self._off_charger()
+            faces = self._visible_faces()
             if faces:
                 _wait(self.robot.behavior.turn_towards_face(faces[0]))
+            else:
+                self.find_caller()                   # person may be behind -> turn to find
             _wait(self.robot.behavior.drive_straight(distance_mm(120), speed_mmps(90)))
             _wait(self.robot.behavior.set_head_angle(degrees(30)))
 
@@ -353,6 +373,8 @@ class SmartVector:
         try:
             if c.startswith('APPROACH'):
                 self.approach()
+            elif c.startswith('FINDME') or c.startswith('TURNTOME') or c.startswith('LOOKATME'):
+                self.find_caller()
             elif c.startswith('CUDDLE'):
                 self.cuddle()
             elif c.startswith('RAISEHAND') or c == 'RAISE_HAND':

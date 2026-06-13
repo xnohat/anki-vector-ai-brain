@@ -58,6 +58,8 @@ BODY_ENABLED = os.environ.get("VECTOR_BODY", "1") not in ("0", "false", "False",
 ACTIONS = (
     "@APPROACH@ come close to the human (turns to your face if seen, then rolls "
     "nearer) — use for 'lại gần', 'đến đây'. "
+    "@FINDME@ turn around to find and face the human who called you (use when "
+    "greeted/called or asked to look at me — they may be behind you). "
     "@CUDDLE@ happy-dog wiggle with your hand(lift) and wheels. "
     "@RAISEHAND@ raise your lift like raising a hand. @LOWERHAND@ lower it. "
     "@LOOKAROUND@ glance around the room. @WIGGLE@ a playful wiggle. "
@@ -108,6 +110,11 @@ MEMORY = MemoryStore(GPT.client)
 _identity = MEMORY.identity()
 if _identity:
     GPT.messages[0]["content"] = _identity + "\n\n---\n\n" + GPT.system_prompt
+# Resume today's conversation so Vector keeps the context of what we're discussing.
+_resume = MEMORY.load_today_chat()
+if _resume:
+    GPT.messages = [GPT.messages[0]] + _resume
+    print(f"[brain] resumed today's chat thread ({len(_resume)} messages)")
 print(f"[brain] memory ON ({MEMORY.__class__.__name__}, dir={os.environ.get('VECTOR_MEM_DIR','memory')})")
 print(f"[brain] ready: model={GPT.model}")
 
@@ -183,6 +190,7 @@ def act_async(reply: str, speak_via_sdk: bool, frame_provider=None, allow_move=T
 # Concise action vocab for cheap, low-token autonomous/reflex prompts.
 SHORT_ACTIONS = (
     "Put action tokens inline; the app runs them. @APPROACH@ roll to human, "
+    "@FINDME@ turn to find/face the caller, "
     "@CUDDLE@ happy wag, @RAISEHAND@, @LOOKAROUND@, @WIGGLE@, @TURN_90@, "
     "@EMOTE_X@ (happy/sad/love/angry/celebrate/confused/surprised), "
     "@EYE_X@ (love/happy/calm/curious/angry), @SILENT@ = do nothing."
@@ -241,11 +249,12 @@ def curiosity_explore():
         url = CustomGPT._encode_image(frame)
         r = GPT.client.chat.completions.create(
             model=AUTO_MODEL, max_tokens=80,
-            messages=[{"role": "user", "content": [
+            messages=[{"role": "system", "content": LIGHT_SYS},
+                      {"role": "user", "content": [
                 {"type": "text", "text":
-                    "Bạn là Vector, robot nhỏ tò mò đang quan sát căn phòng. Nói MỘT câu "
-                    "ngắn tiếng Việt về một điều thú vị bạn thấy hoặc học được, kèm "
-                    "@EYE_curious@ hoặc @LOOKAROUND@. Nếu không có gì mới, chỉ @SILENT@."},
+                    "You are a curious little robot looking around the room. Say ONE "
+                    "short line about something interesting you see or learn, with "
+                    "@EYE_curious@ or @LOOKAROUND@. If nothing is new, just @SILENT@."},
                 {"type": "image_url", "image_url": {"url": url}}]}])
         reply = (r.choices[0].message.content or "@SILENT@").strip()
     except Exception as exc:
@@ -254,7 +263,7 @@ def curiosity_explore():
     said = act_async(reply, speak_via_sdk=True, allow_move=False)
     learned = clean_spoken(reply)
     if learned and learned != "...":
-        MEMORY.remember(f"Quan sát/học được: {learned}", tag="learn")
+        MEMORY.remember(f"Observed/learned: {learned}", tag="learn")
         print(f"[curious] {learned}")
 
 
@@ -327,24 +336,25 @@ def reflex_loop():
 
         event = None
         allow_move = True
+        is_petting = False
         if not suppress and now - last_event > EVENT_COOLDOWN:
             if picked and not prev_pick:
-                event, allow_move = "Người chủ vừa nhấc bạn lên khỏi mặt đất.", False
+                event, allow_move = "Someone just picked you up off the ground.", False
             elif prev_pick and not picked:
-                event = "Bạn vừa được đặt xuống mặt phẳng."
+                event = "You were just put back down on a surface."
             elif az < FLIP_AZ and not picked:
-                event, allow_move = "Bạn vừa bị lật nghiêng hoặc úp ngược.", False
+                event, allow_move = "You were just tilted or flipped over.", False
             elif shake >= 3:
-                event, allow_move = "Ai đó đang lắc người bạn.", False
+                event, allow_move = "Someone is shaking you.", False
             elif touched and not prev_touch:
-                event = "Người chủ đang vuốt ve lưng bạn."
+                event, is_petting = "Your owner is petting your back.", True
         prev_touch, prev_pick = touched, picked
 
         if event:
             last_event = now
             shake = 0
             try:
-                if "vuốt" in event:
+                if is_petting:
                     ROBOT.act("CUDDLE")
                 react(event, allow_move=allow_move)
             except Exception as exc:
@@ -359,7 +369,7 @@ def reflex_loop():
                     and not suppress and now - last_batt > 120):
                 last_batt = now
                 try:
-                    react("Pin sắp cạn! Kêu cứu thật đáng yêu bằng tiếng Việt.")
+                    react("Your battery is almost empty! Cutely yell for help.")
                     ROBOT.return_to_charger()
                 except Exception as exc:
                     print(f"[reflex] battery: {exc}")
@@ -438,8 +448,11 @@ class Handler(BaseHTTPRequestHandler):
         low = user.lower()
         if ROBOT is not None and any(w in low for w in VISION_WORDS):
             frame = ROBOT.get_frame()
-        # QMD recall: pull relevant long-term memories into this answer.
-        mems = MEMORY.recall(user)
+        # Context = always-on daily memory (long-term + today's notes) + QMD recall,
+        # on top of the live conversation thread already in GPT.messages.
+        ctx = MEMORY.today_context()
+        recalled = MEMORY.recall(user)
+        mems = (ctx + ("\n\n# Relevant memories\n" + recalled if recalled else "")).strip()
         with _BRAIN_LOCK:
             raw = GPT.get_answer(user, image=frame, memories=mems)
         spoken = clean_spoken(raw) or "..."
@@ -513,8 +526,8 @@ def _describe_person(frame) -> str:
         r = GPT.client.chat.completions.create(
             model=AUTO_MODEL, max_tokens=120,
             messages=[{"role": "user", "content": [
-                {"type": "text", "text": "Mô tả ngắn người trong ảnh (vẻ ngoài, đặc "
-                 "điểm dễ nhớ) bằng tiếng Việt, 1-2 câu."},
+                {"type": "text", "text": "Briefly describe the person in this image "
+                 "(appearance, memorable features) in English, 1-2 sentences."},
                 {"type": "image_url", "image_url": {"url": url}}]}])
         return (r.choices[0].message.content or "").strip()
     except Exception as exc:
@@ -541,30 +554,44 @@ def _maybe_meet_person(user_text: str) -> None:
                 pic = _pil_to_jpeg(frame)
             except Exception:
                 pic = None
-    MEMORY.save_user(name, desc or "(chưa rõ vẻ ngoài)", pic_jpeg=pic)
-    MEMORY.remember(f"Lần đầu gặp {name}." + (f" {desc}" if desc else ""), tag="people")
+    MEMORY.save_user(name, desc or "(appearance unknown)", pic_jpeg=pic)
+    MEMORY.remember(f"First met {name}." + (f" {desc}" if desc else ""), tag="people")
     print(f"[memory] met new person: {name}")
 
 
 def _post_chat(user: str, spoken: str) -> None:
-    """After a voice exchange: write it to the journal + learn about new people."""
+    """After a voice exchange: persist the chat thread + journal + learn people."""
     try:
-        MEMORY.remember(f"Người dùng nói \"{user}\". Vector đáp \"{spoken}\".", tag="chat")
+        MEMORY.append_chat("user", user)         # daily chat thread (context)
+        MEMORY.append_chat("assistant", spoken)
+        MEMORY.remember(f'User: "{user}" | Vector: "{spoken}"', tag="chat")
         _maybe_meet_person(user)
     except Exception as exc:
         print(f"[memory] post_chat failed: {exc}")
 
 
 def consolidate_loop():
-    """Vector Brain consolidates the journals into long-term MEMORY.md daily."""
-    interval = float(os.environ.get("VECTOR_CONSOLIDATE_HOURS", "8")) * 3600
+    """Runs 24/7. On each new day, Vector Brain consolidates the finished day's
+    journal into long-term MEMORY.md and starts a fresh daily chat thread."""
+    current_day = time.strftime("%d-%m-%Y")
     while True:
-        time.sleep(interval)
+        time.sleep(1800)   # check for day rollover every 30 min
+        day = time.strftime("%d-%m-%Y")
+        if day == current_day:
+            continue
+        current_day = day
         try:
             if MEMORY.consolidate():
-                print("[memory] consolidated journals -> MEMORY.md")
+                print("[memory] new day -> consolidated journals into MEMORY.md")
         except Exception as exc:
-            print(f"[memory] consolidate loop: {exc}")
+            print(f"[memory] consolidate: {exc}")
+        # Fresh daily chat thread; continuity now comes from long-term + journal.
+        try:
+            with _BRAIN_LOCK:
+                GPT.messages = [GPT.messages[0]]
+            print("[brain] new day -> fresh chat thread")
+        except Exception:
+            pass
 
 
 def main():

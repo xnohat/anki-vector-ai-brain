@@ -67,6 +67,61 @@ class MemoryStore:
     def longterm(self) -> str:
         return _read(os.path.join(MEM_DIR, "MEMORY.md"))
 
+    # ---- daily chat thread (raw conversation, persisted + reloaded) ----
+    def chat_path(self, day: str = None) -> str:
+        return os.path.join(MEM_DIR, f"CHAT-{day or _today()}.jsonl")
+
+    def append_chat(self, role: str, content: str) -> None:
+        if not content:
+            return
+        try:
+            with open(self.chat_path(), "a", encoding="utf-8") as f:
+                f.write(json.dumps({"t": _stamp(), "role": role, "content": content},
+                                   ensure_ascii=False) + "\n")
+        except Exception as exc:
+            print(f"[memory] append_chat failed: {exc}")
+
+    def load_today_chat(self, max_msgs: int = 24) -> list:
+        """Today's conversation as [{role, content}] (recent tail) for context."""
+        out = []
+        try:
+            with open(self.chat_path(), "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    d = json.loads(line)
+                    if d.get("role") in ("user", "assistant") and d.get("content"):
+                        out.append({"role": d["role"], "content": d["content"]})
+        except FileNotFoundError:
+            pass
+        except Exception as exc:
+            print(f"[memory] load_today_chat failed: {exc}")
+        return out[-max_msgs:]
+
+    # ---- auto-loaded daily context (openclaw-style: long-term + recent notes) ----
+    def journal_recent(self, max_lines: int = 25) -> str:
+        """Today + yesterday's journal lines (recent tail)."""
+        days = [time.strftime("%d-%m-%Y", time.localtime(time.time() - 86400)), _today()]
+        lines = []
+        for d in days:
+            for ln in _read(self.journal_path(d)).splitlines():
+                ln = ln.strip()
+                if ln and not ln.startswith("#"):
+                    lines.append(ln)
+        return "\n".join(lines[-max_lines:])
+
+    def today_context(self) -> str:
+        """Compact always-on context: long-term memory + recent journal."""
+        parts = []
+        lt = self.longterm().strip()
+        if lt:
+            parts.append("# Long-term memory\n" + lt)
+        recent = self.journal_recent()
+        if recent:
+            parts.append("# Recent journal (yesterday/today)\n" + recent)
+        return "\n\n".join(parts)
+
     def remember(self, text: str, tag: str = "note") -> None:
         """Append one observation/event to today's journal."""
         text = (text or "").strip().replace("\n", " ")
@@ -180,6 +235,8 @@ class MemoryStore:
             return ""
         qv = np.array(qv, dtype=np.float32)
         qn = qv / (np.linalg.norm(qv) + 1e-9)
+        # hybrid: vector similarity + keyword overlap (catches names / exact terms)
+        qwords = set(w for w in re.findall(r"\w+", query.lower()) if len(w) > 2)
         scored = []
         for src, txt in chunks:
             h = hashlib.sha1(txt.encode("utf-8")).hexdigest()
@@ -188,9 +245,11 @@ class MemoryStore:
                 continue
             vv = np.array(v, dtype=np.float32)
             sim = float(np.dot(qn, vv / (np.linalg.norm(vv) + 1e-9)))
-            scored.append((sim, src, txt))
+            kw = (len(qwords & set(re.findall(r"\w+", txt.lower()))) / (len(qwords) + 1)
+                  if qwords else 0.0)
+            scored.append((sim + 0.15 * kw, src, txt))
         scored.sort(reverse=True)
-        top = [f"({src}) {txt}" for sim, src, txt in scored[:k] if sim > 0.18]
+        top = [f"({src}) {txt}" for sc, src, txt in scored[:k] if sc > 0.18]
         return "\n".join(top)
 
     # ------------------------------------------------------- consolidation
@@ -205,12 +264,14 @@ class MemoryStore:
                              for j in journals[-5:])
         current = self.longterm()
         prompt = (
-            "You are Vector's memory-consolidation process. From your existing "
+            "You are Vector's memory-consolidation process. From the existing "
             "long-term memory and recent daily journals, write an updated, concise "
-            "long-term memory in Vietnamese. Keep durable facts about the people you "
-            "love (names, traits, preferences, promises), routines, and what you have "
-            "learned about your world. Merge duplicates, drop trivial one-offs. "
-            "Output ONLY the new MEMORY.md content (markdown).\n\n"
+            "long-term memory in ENGLISH (this is an open-source project; keep the "
+            "file readable to contributors, but preserve names and short quotes as-is). "
+            "Keep durable facts about the people Vector loves (names, traits, "
+            "preferences, promises), routines, and what he has learned about his world. "
+            "Merge duplicates, drop trivial one-offs. Output ONLY the new MEMORY.md "
+            "content (markdown).\n\n"
             f"=== CURRENT LONG-TERM MEMORY ===\n{current}\n\n"
             f"=== RECENT JOURNALS ===\n{recent}"
         )
