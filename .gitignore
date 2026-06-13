@@ -165,3 +165,9 @@ cython_debug/
 #.idea/
 
 *.wav
+
+# Vector's personal memory (journals, people, photos, embedding cache) — local only
+memory/MEMORY-*.md
+memory/MEMORY.md
+memory/USER-*
+memory/.qmd_index.json

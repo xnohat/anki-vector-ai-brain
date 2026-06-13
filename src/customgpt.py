@@ -137,8 +137,9 @@ class CustomGPT:
     # ------------------------------------------------------------------ #
     # main entry point
     # ------------------------------------------------------------------ #
-    def get_answer(self, query: str, image: PIL.Image.Image = None) -> str:
-        """Get Vector's reply. If `image` is given, Vector sees it as his eyes."""
+    def get_answer(self, query: str, image: PIL.Image.Image = None, memories: str = None) -> str:
+        """Get Vector's reply. If `image` is given, Vector sees it as his eyes.
+        `memories` (recalled long-term memory) is injected for THIS call only."""
         if not query and image is None:
             return ""
 
@@ -153,11 +154,19 @@ class CustomGPT:
 
         self.messages.append({"role": "user", "content": user_content})
 
+        # Inject recalled long-term memory as a transient system note (this call
+        # only — not stored in history, so context stays clean and bounded).
+        call_messages = self.messages
+        if memories:
+            mem_msg = {"role": "system",
+                       "content": "Ký ức liên quan của bạn (dùng nếu hữu ích):\n" + memories}
+            call_messages = self.messages[:-1] + [mem_msg] + self.messages[-1:]
+
         try:
             chat = self.client.chat.completions.create(
                 model=self.model,
                 temperature=1.0,
-                messages=self.messages,
+                messages=call_messages,
             )
             reply = chat.choices[0].message.content or ""
         except Exception as exc:

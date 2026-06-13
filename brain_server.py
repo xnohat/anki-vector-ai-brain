@@ -100,6 +100,15 @@ else:
     STT = None
     print(f"[brain] STT backend: OpenAI {STT_API_MODEL} (fast, lang={STT_API_LANG})")
 VOICE = Voice()
+
+# Long-term memory (AI-agent brain): identity, people, journal, consolidated
+# knowledge, with QMD (embedding) recall feeding the LLM.
+from memory import MemoryStore
+MEMORY = MemoryStore(GPT.client)
+_identity = MEMORY.identity()
+if _identity:
+    GPT.messages[0]["content"] = _identity + "\n\n---\n\n" + GPT.system_prompt
+print(f"[brain] memory ON ({MEMORY.__class__.__name__}, dir={os.environ.get('VECTOR_MEM_DIR','memory')})")
 print(f"[brain] ready: model={GPT.model}")
 
 
@@ -219,17 +228,56 @@ def busy() -> bool:
         return False
 
 
+# How many idle ticks between curiosity (look + learn) moments.
+CURIOSITY_EVERY = int(os.environ.get("VECTOR_CURIOSITY_EVERY", "8"))
+
+
+def curiosity_explore():
+    """Vector looks at his world, says one curious thing, and LEARNS it (journal)."""
+    frame = ROBOT.get_frame()
+    if frame is None:
+        return
+    try:
+        url = CustomGPT._encode_image(frame)
+        r = GPT.client.chat.completions.create(
+            model=AUTO_MODEL, max_tokens=80,
+            messages=[{"role": "user", "content": [
+                {"type": "text", "text":
+                    "Bạn là Vector, robot nhỏ tò mò đang quan sát căn phòng. Nói MỘT câu "
+                    "ngắn tiếng Việt về một điều thú vị bạn thấy hoặc học được, kèm "
+                    "@EYE_curious@ hoặc @LOOKAROUND@. Nếu không có gì mới, chỉ @SILENT@."},
+                {"type": "image_url", "image_url": {"url": url}}]}])
+        reply = (r.choices[0].message.content or "@SILENT@").strip()
+    except Exception as exc:
+        print(f"[curious] {exc}")
+        return
+    said = act_async(reply, speak_via_sdk=True, allow_move=False)
+    learned = clean_spoken(reply)
+    if learned and learned != "...":
+        MEMORY.remember(f"Quan sát/học được: {learned}", tag="learn")
+        print(f"[curious] {learned}")
+
+
 # --------------------------------------------------------------------------- #
 # Autonomous loop — cheap model, every ~15s, mostly silent, never interrupts.
+# Occasionally Vector gets curious and explores/learns about his world.
 # --------------------------------------------------------------------------- #
+_TICK = {"n": 0}
+
+
 def autonomous_loop():
     while True:
         time.sleep(AGENT_INTERVAL)
         if not AUTONOMOUS or busy():
             continue
+        _TICK["n"] += 1
         try:
             faces = ROBOT.sense().get("faces_visible", 0)
             _, charging, on_charger = ROBOT.battery()
+            # every Nth idle tick: be curious — look at the world and learn.
+            if _TICK["n"] % CURIOSITY_EVERY == 0:
+                curiosity_explore()
+                continue
             sit = (f"You are resting. on_charger={on_charger}, face_seen={faces > 0}. "
                    "Usually reply @SILENT@. About 1 in 5 times do ONE tiny delightful "
                    "thing: look around, a gentle eye colour, or (only if a face is seen "
@@ -390,13 +438,17 @@ class Handler(BaseHTTPRequestHandler):
         low = user.lower()
         if ROBOT is not None and any(w in low for w in VISION_WORDS):
             frame = ROBOT.get_frame()
+        # QMD recall: pull relevant long-term memories into this answer.
+        mems = MEMORY.recall(user)
         with _BRAIN_LOCK:
-            raw = GPT.get_answer(user, image=frame)
+            raw = GPT.get_answer(user, image=frame, memories=mems)
         spoken = clean_spoken(raw) or "..."
         print(f"[chat] vector: {spoken!r}  ({[c for c in parse_commands(raw)]})")
 
         # Perform body actions in the background so the spoken reply isn't delayed.
         threading.Thread(target=_deferred_act, args=(raw,), daemon=True).start()
+        # Remember the exchange + learn about new people, in the background.
+        threading.Thread(target=_post_chat, args=(user, spoken), daemon=True).start()
 
         if stream:
             self._stream(spoken)
@@ -443,10 +495,83 @@ def _deferred_act(raw):
     _STATE["voice_active"] = time.time()
 
 
+import io
+# "tôi tên là X", "tên tôi là X", "mình tên X", "tao tên là X"
+NAME_RE = re.compile(r"t[êe]n\s+(?:t[ôo]i\s+|m[ìi]nh\s+|tao\s+)?(?:l[àa]\s+)?([A-Za-zÀ-ỹ][\wÀ-ỹ]{1,20})", re.U | re.I)
+_STOP = {"là", "la", "tôi", "toi", "mình", "minh", "tao", "gì", "gi", "không", "nhỉ"}
+
+
+def _pil_to_jpeg(frame) -> bytes:
+    buf = io.BytesIO()
+    frame.convert("RGB").save(buf, format="JPEG", quality=85)
+    return buf.getvalue()
+
+
+def _describe_person(frame) -> str:
+    try:
+        url = CustomGPT._encode_image(frame)
+        r = GPT.client.chat.completions.create(
+            model=AUTO_MODEL, max_tokens=120,
+            messages=[{"role": "user", "content": [
+                {"type": "text", "text": "Mô tả ngắn người trong ảnh (vẻ ngoài, đặc "
+                 "điểm dễ nhớ) bằng tiếng Việt, 1-2 câu."},
+                {"type": "image_url", "image_url": {"url": url}}]}])
+        return (r.choices[0].message.content or "").strip()
+    except Exception as exc:
+        print(f"[memory] describe failed: {exc}")
+        return ""
+
+
+def _maybe_meet_person(user_text: str) -> None:
+    m = NAME_RE.search(user_text or "")
+    if not m:
+        return
+    name = m.group(1).strip()
+    if name.lower() in _STOP or len(name) < 2:
+        return
+    if MEMORY.knows_user(name):
+        return
+    desc = ""
+    pic = None
+    if ROBOT is not None:
+        frame = ROBOT.get_frame()
+        if frame is not None:
+            desc = _describe_person(frame)
+            try:
+                pic = _pil_to_jpeg(frame)
+            except Exception:
+                pic = None
+    MEMORY.save_user(name, desc or "(chưa rõ vẻ ngoài)", pic_jpeg=pic)
+    MEMORY.remember(f"Lần đầu gặp {name}." + (f" {desc}" if desc else ""), tag="people")
+    print(f"[memory] met new person: {name}")
+
+
+def _post_chat(user: str, spoken: str) -> None:
+    """After a voice exchange: write it to the journal + learn about new people."""
+    try:
+        MEMORY.remember(f"Người dùng nói \"{user}\". Vector đáp \"{spoken}\".", tag="chat")
+        _maybe_meet_person(user)
+    except Exception as exc:
+        print(f"[memory] post_chat failed: {exc}")
+
+
+def consolidate_loop():
+    """Vector Brain consolidates the journals into long-term MEMORY.md daily."""
+    interval = float(os.environ.get("VECTOR_CONSOLIDATE_HOURS", "8")) * 3600
+    while True:
+        time.sleep(interval)
+        try:
+            if MEMORY.consolidate():
+                print("[memory] consolidated journals -> MEMORY.md")
+        except Exception as exc:
+            print(f"[memory] consolidate loop: {exc}")
+
+
 def main():
     if ROBOT is not None and AUTONOMOUS:
         threading.Thread(target=autonomous_loop, daemon=True).start()
         print(f"[brain] autonomous loop ON (every {AGENT_INTERVAL:.0f}s, model={AUTO_MODEL})")
+    threading.Thread(target=consolidate_loop, daemon=True).start()
     if ROBOT is not None and TOUCH_ENABLED:
         threading.Thread(target=reflex_loop, daemon=True).start()
         print("[brain] reflex loop ON (cliff-safety, pickup/shake/flip/touch/battery)")
