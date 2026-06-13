@@ -542,7 +542,7 @@ EVENT_COOLDOWN = float(os.environ.get("VECTOR_EVENT_COOLDOWN", "6"))
 
 
 def reflex_loop():
-    prev_touch = prev_pick = prev_cliff = False
+    prev_touch = prev_pick = prev_cliff = prev_flipped = False
     last_event = last_batt = batt_check = last_snap = 0.0
     shake = 0
     while True:
@@ -572,23 +572,27 @@ def reflex_loop():
         prev_cliff = cliff
 
         shake = min(6, shake + 1) if gmag > SHAKE_GYRO else max(0, shake - 1)
-        suppress = busy() or (now - _STATE.get("button_ts", 0) < 6)
+        # Reflexes react TO touch/pickup/flip/shake, so do NOT suppress on those
+        # (busy() includes held/touched). Only hold back during active voice/listening.
+        suppress = (now - _STATE["voice_active"] < VOICE_BACKOFF) or \
+                   (now - _STATE.get("button_ts", 0) < 6)
 
+        flipped = az < FLIP_AZ
         event = None
         allow_move = True
         is_petting = False
         if not suppress and now - last_event > EVENT_COOLDOWN:
-            if picked and not prev_pick:
+            if flipped and not prev_flipped:           # works held or not; check first
+                event, allow_move = "You were just tilted or flipped over!", False
+            elif picked and not prev_pick:
                 event, allow_move = "Someone just picked you up off the ground.", False
             elif prev_pick and not picked:
                 event = "You were just put back down on a surface."
-            elif az < FLIP_AZ and not picked:
-                event, allow_move = "You were just tilted or flipped over.", False
             elif shake >= 3:
                 event, allow_move = "Someone is shaking you.", False
             elif touched and not prev_touch:
                 event, is_petting = "Your owner is petting your back.", True
-        prev_touch, prev_pick = touched, picked
+        prev_touch, prev_pick, prev_flipped = touched, picked, flipped
 
         if event:
             last_event = now
