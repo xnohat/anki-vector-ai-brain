@@ -3,8 +3,10 @@
 # running/zombie brain + wire-pod first (gracefully, so the SDK disconnects and
 # the robot frees behaviour control) before starting fresh.
 #
-# Usage:  ./run.sh             (brain server + wire-pod brain bridge)
-#         ./run.sh --no-pod    (brain server only)
+# Usage:  ./run.sh                    (brain server + wire-pod brain bridge)
+#         ./run.sh --no-pod           (brain server only)
+#         ./run.sh --install-daemon   (run 24/7 via systemd, start on boot)
+#         ./run.sh --uninstall-daemon (remove the systemd service)
 set -e
 HERE="$(cd "$(dirname "$0")" && pwd)"
 WIREPOD_DIR="${WIREPOD_DIR:-$HOME/wire-pod}"
@@ -12,6 +14,54 @@ CHIPPER="$WIREPOD_DIR/chipper"
 BRAIN_PORT="${BRAIN_PORT:-7070}"
 
 cd "$HERE"
+
+# --------------------------------------------------------------------------- #
+# Daemon setup: run the Vector Brain Agent 24/7 via systemd (starts on boot)
+# --------------------------------------------------------------------------- #
+SERVICE="vector-brain"
+SERVICE_FILE="/etc/systemd/system/${SERVICE}.service"
+
+if [ "$1" == "--install-daemon" ]; then
+    echo "Installing ${SERVICE}.service (Vector Brain 24/7, starts on boot)..."
+    sudo tee "$SERVICE_FILE" >/dev/null <<UNIT
+[Unit]
+Description=Vector Brain AI Agent (gpt-5.5 brain + wire-pod bridge)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=$(id -un)
+Environment=HOME=$HOME
+WorkingDirectory=$HERE
+ExecStart=$HERE/run.sh
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=25
+KillSignal=SIGTERM
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+    sudo systemctl daemon-reload
+    sudo systemctl enable "$SERVICE"
+    sudo systemctl restart "$SERVICE"
+    echo "Done. The agent now runs 24/7 and on boot."
+    echo "  status:  sudo systemctl status $SERVICE"
+    echo "  stop:    sudo systemctl stop $SERVICE"
+    echo "  logs:    journalctl -u $SERVICE -f   (brain: /tmp/vector-brain.log)"
+    exit 0
+fi
+
+if [ "$1" == "--uninstall-daemon" ]; then
+    echo "Removing ${SERVICE} daemon..."
+    sudo systemctl disable --now "$SERVICE" 2>/dev/null || true
+    sudo rm -f "$SERVICE_FILE"
+    sudo systemctl daemon-reload
+    echo "Removed. Use ./run.sh to start manually."
+    exit 0
+fi
+
 [ -d .venv ] || { echo "No .venv — run: python3 -m venv .venv && .venv/bin/pip install -r requirements.txt"; exit 1; }
 [ -f .env ] && { set -a; . ./.env; set +a; }
 
