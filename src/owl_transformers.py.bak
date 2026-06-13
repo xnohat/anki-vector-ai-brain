@@ -1,0 +1,172 @@
+from typing import Tuple, List, Dict
+import os
+import PIL.Image
+import numpy as np
+from PIL import ImageDraw, ImageFont
+import torch
+from transformers import OwlViTProcessor, OwlViTForObjectDetection
+import re
+
+class HootHoot:
+    def __init__(
+            self, 
+            model: str = "google/owlvit-base-patch32",
+            device: str = "cpu"
+    ) -> None:
+        """
+        Initialize OWL-ViT object detector for Raspberry Pi.
+        Uses Hugging Face Transformers instead of nanoowl.
+        
+        Args:
+            model: Model name from Hugging Face (default: google/owlvit-base-patch32)
+            device: Device to run on ("cpu" for Raspberry Pi)
+        """
+        print(f"Loading {model} model on {device}...")
+        self.device = device
+        self.processor = OwlViTProcessor.from_pretrained(model)
+        self.model = OwlViTForObjectDetection.from_pretrained(model)
+        self.model.to(device)
+        self.model.eval()
+        
+        self.prompt = '[]'
+        self.cached_labels = []
+        print("Model loaded successfully!")
+    
+    def _parse_prompt(self, prompt: str) -> List[str]:
+        """
+        Parse prompt string to extract labels.
+        Handles formats like "[a person, toys]" or "person, toys"
+        """
+        # Remove brackets and split by comma
+        prompt = prompt.strip()
+        if prompt.startswith('[') and prompt.endswith(']'):
+            prompt = prompt[1:-1]
+        
+        # Split by comma and clean up
+        labels = [label.strip() for label in prompt.split(',')]
+        # Remove 'a' and 'an' prefixes
+        labels = [re.sub(r'^(a|an)\s+', '', label) for label in labels]
+        return [label for label in labels if label]  # Remove empty strings
+    
+    def _draw_predictions(
+        self, 
+        image: PIL.Image.Image, 
+        boxes: List[List[float]], 
+        scores: List[float], 
+        labels: List[str]
+    ) -> PIL.Image.Image:
+        """
+        Draw bounding boxes and labels on the image.
+        """
+        draw = ImageDraw.Draw(image)
+        
+        # Try to load a font, fall back to default if not available
+        try:
+            font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 16)
+        except:
+            font = ImageFont.load_default()
+        
+        colors = [
+            'red', 'green', 'blue', 'yellow', 'purple', 
+            'orange', 'pink', 'cyan', 'magenta', 'lime'
+        ]
+        
+        for i, (box, score, label) in enumerate(zip(boxes, scores, labels)):
+            color = colors[i % len(colors)]
+            
+            # Draw bounding box
+            draw.rectangle(box, outline=color, width=3)
+            
+            # Draw label with background
+            text = f"{label}: {score:.2f}"
+            bbox = draw.textbbox((box[0], box[1]), text, font=font)
+            draw.rectangle(bbox, fill=color)
+            draw.text((box[0], box[1]), text, fill='white', font=font)
+        
+        return image
+
+    def predict(
+            self, 
+            image: PIL.Image.Image, 
+            prompt: str,
+            threshold: float = 0.1
+        ) -> Tuple[Dict, PIL.Image.Image]:
+        """
+        Perform zero-shot object detection on the image.
+        
+        Args:
+            image: PIL Image to detect objects in
+            prompt: String with object labels (e.g., "[a person, toys]")
+            threshold: Confidence threshold for detections (default: 0.1)
+            
+        Returns:
+            Tuple of (output dict, annotated image)
+        """
+        # Parse labels from prompt
+        if self.prompt != prompt:
+            self.prompt = prompt
+            self.cached_labels = self._parse_prompt(prompt)
+        
+        if not self.cached_labels:
+            # No labels to detect
+            return {"detections": []}, image.copy()
+        
+        # Prepare inputs
+        inputs = self.processor(
+            text=[self.cached_labels], 
+            images=image, 
+            return_tensors="pt"
+        )
+        inputs = {k: v.to(self.device) for k, v in inputs.items()}
+        
+        # Run inference
+        with torch.no_grad():
+            outputs = self.model(**inputs)
+        
+        # Post-process results
+        target_sizes = torch.tensor([image.size[::-1]])  # (height, width)
+        results = self.processor.post_process_object_detection(
+            outputs=outputs, 
+            threshold=threshold, 
+            target_sizes=target_sizes
+        )[0]
+        
+        # Extract detections
+        boxes = results["boxes"].cpu().numpy()
+        scores = results["scores"].cpu().numpy()
+        label_ids = results["labels"].cpu().numpy()
+        
+        # Convert to format compatible with original API
+        detections = []
+        filtered_boxes = []
+        filtered_scores = []
+        filtered_labels = []
+        
+        for box, score, label_id in zip(boxes, scores, label_ids):
+            label = self.cached_labels[label_id]
+            detections.append({
+                "label": label,
+                "score": float(score),
+                "box": box.tolist()
+            })
+            filtered_boxes.append(box.tolist())
+            filtered_scores.append(float(score))
+            filtered_labels.append(label)
+        
+        output = {
+            "detections": detections,
+            "labels": self.cached_labels,
+            "count": len(detections)
+        }
+        
+        # Draw predictions on image
+        annotated_image = image.copy()
+        if detections:
+            annotated_image = self._draw_predictions(
+                annotated_image, 
+                filtered_boxes, 
+                filtered_scores, 
+                filtered_labels
+            )
+        
+        return output, annotated_image

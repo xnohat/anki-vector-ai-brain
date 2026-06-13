@@ -1,0 +1,39 @@
+# Core dependencies for Vector Advanced AI on Raspberry Pi
+
+# Object Detection - Option 1: OWL-ViT with Transformers (Default)
+# Replacing nanoowl with Hugging Face Transformers for Raspberry Pi
+torch>=2.0.0
+torchvision>=0.15.0
+transformers>=4.30.0
+Pillow>=9.0.0
+numpy>=1.21.0
+
+# Object Detection - Option 2: YOLOv8 (Faster Alternative)
+# Currently using YOLO - comment out if switching back to OWL-ViT
+ultralytics>=8.0.0
+
+# UI Dependencies
+customtkinter>=5.0.0
+opencv-python>=4.5.0
+
+# Audio/Speech Dependencies
+sounddevice>=0.4.0
+scipy>=1.7.0
+openai-whisper>=20230314
+
+# ChatGPT Integration
+openai>=1.0.0
+
+# Optional: For even faster inference (uncomment if needed)
+# onnxruntime>=1.15.0  # CPU-optimized inference runtime
+
+# For Vector Robot SDK
+# The vector-python-sdk should be installed separately from the local directory
+# Install with: pip install -e vector-python-sdk/
+# Note: Vector SDK requires older protobuf version
+protobuf<=3.20.3
+
+# Note: Choose only ONE object detection method:
+# - Keep torch+transformers for zero-shot detection (slower but flexible)
+# - OR use ultralytics for faster YOLO-based detection (80 classes only)
+
