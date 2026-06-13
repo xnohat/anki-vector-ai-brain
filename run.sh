@@ -32,7 +32,7 @@ echo "=== [0/3] Ensuring wire-pod has the Brain bridge ==="
 echo "=== [1/3] Starting Vector Brain server (port $BRAIN_PORT) ==="
 # Vietnamese STT model: 'small' is a good accuracy/speed balance on a Pi.
 export VECTOR_STT_MODEL="${VECTOR_STT_MODEL:-small}"
-"$HERE/.venv/bin/python" brain_server.py >/tmp/vector-brain.log 2>&1 &
+"$HERE/.venv/bin/python" -u brain_server.py >/tmp/vector-brain.log 2>&1 &
 BRAIN_PID=$!
 echo "    brain server pid $BRAIN_PID (log: /tmp/vector-brain.log)"
 

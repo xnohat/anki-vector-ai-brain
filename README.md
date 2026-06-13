@@ -1,8 +1,22 @@
 # vector-advanced-ai
 
-> Vector with Advanced AI compatibilities — a smart Anki Vector with an LLM brain that can **see, listen, talk and act**.
+> A smart Anki Vector **robot pet** with a gpt-5.5 brain — it listens with its own
+> mic, talks and thinks in Vietnamese, sees, feels touch, senses its world, and
+> acts with its body. One brain, one body, one process.
 
 ![vector](resources/vector.jpg)
+
+## What it does
+- **Listens** through Vector's *real* microphone ("Hey Vector, …") via wire-pod.
+- **Thinks** with one gpt-5.5 brain (Vietnamese, sassy-but-loving pet personality).
+- **Acts** with its body: come near you (`@APPROACH@` — turns to your face, rolls
+  closer), cuddle like a happy dog (hand + wheels), raise its hand, look around,
+  drive/turn, change eye colour, emote.
+- **Feels** the backpack touch and being picked up → cuddles and reacts.
+- **Senses** everything (battery, proximity, cliff, faces, held/picked-up, …) and
+  an **autonomous agent loop** lets the LLM judge it and do delightful unexpected
+  things — roll over and say *"Em nhớ anh quá"*, raise a hand, look around.
+- **Sees** through its camera when you ask.
 
 ## How it works
 
