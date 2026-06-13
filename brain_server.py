@@ -598,9 +598,14 @@ def reflex_loop():
             last_event = now
             shake = 0
             try:
-                if is_petting:
-                    ROBOT.act("CUDDLE")
-                react(event, allow_move=allow_move)
+                # Grab control IMMEDIATELY to override Vector's native firmware
+                # reaction, hold it through our whole reaction, then release.
+                with ROBOT.control():
+                    if is_petting:
+                        ROBOT.act("CUDDLE")
+                    else:
+                        ROBOT.emote("surprised")   # instant, interrupts the native anim
+                    react(event, allow_move=allow_move)
             except Exception as exc:
                 print(f"[reflex] {exc}")
             continue
