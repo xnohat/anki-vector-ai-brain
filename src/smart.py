@@ -62,6 +62,13 @@ class SmartVector:
             enable_face_detection=True,
         )
         self.robot.connect()
+        # CRITICAL: do NOT hold behaviour control while idle, or we fight wire-pod
+        # (causes the robot to get stuck in the listening/"thinking" state with a
+        # looping noise, and blocks voice/button). Release now; grab only to act.
+        try:
+            _wait(self.robot.conn.release_control(), timeout=8)
+        except Exception:
+            pass
         try:
             self.robot.camera.init_camera_feed()
         except Exception:
@@ -79,13 +86,19 @@ class SmartVector:
     # -------------------------------------------------------------- control
     @contextmanager
     def control(self, level=ControlPriorityLevel.OVERRIDE_BEHAVIORS_PRIORITY):
-        """Serialize all robot actions. Control is held continuously (OVERRIDE on
-        connect), so this just guarantees one action at a time across threads."""
+        """Ephemeral, reentrant behaviour control: request only while acting, then
+        release so the robot is free for wire-pod voice/button. Serializes actions."""
         with self._lock:
+            if self._depth == 0:
+                _wait(self.robot.conn.request_control(level), timeout=8)
+            self._depth += 1
             try:
                 yield
             finally:
-                self.last_action = time.time()
+                self._depth -= 1
+                if self._depth == 0:
+                    _wait(self.robot.conn.release_control(), timeout=8)
+                    self.last_action = time.time()
 
     # -------------------------------------------------------------- sensing
     def get_frame(self) -> PIL.Image.Image:
@@ -95,8 +108,12 @@ class SmartVector:
             return None
 
     def feel(self) -> tuple:
-        """Cheap, RPC-free read of (being_touched, is_being_held) for fast polling."""
-        touched = held = False
+        """Cheap, RPC-free read of (touched, held, button) for fast polling.
+
+        `button` (backpack button pressed) means 'listen to me' — the caller must
+        NOT react to it, so the robot's own voice/listening can run undisturbed.
+        """
+        touched = held = button = False
         try:
             t = self.robot.touch.last_sensor_reading
             if t is not None:
@@ -107,7 +124,11 @@ class SmartVector:
             held = bool(self.robot.status.is_being_held)
         except Exception:
             pass
-        return touched, held
+        try:
+            button = bool(self.robot.status.is_button_pressed)
+        except Exception:
+            pass
+        return touched, held, button
 
     def sense(self) -> dict:
         """Everything Vector can feel right now — handed to the LLM to judge."""
@@ -162,8 +183,18 @@ class SmartVector:
         with self.control():
             _wait(self.robot.behavior.set_eye_color(hue=h, saturation=sat))
 
+    def _off_charger(self) -> None:
+        """If docked, roll off the charger so the wheels can actually move."""
+        try:
+            if self.robot.status.is_on_charger:
+                _wait(self.robot.behavior.drive_off_charger())
+                time.sleep(0.3)
+        except Exception:
+            pass
+
     def drive(self, left: int, right: int, dur: float) -> None:
         with self.control():
+            self._off_charger()
             self.robot.motors.set_wheel_motors(left, right)
             time.sleep(max(0.1, min(dur, 6.0)))
             self.robot.motors.set_wheel_motors(0, 0)
@@ -183,6 +214,7 @@ class SmartVector:
     def approach(self) -> None:
         """Come near the human: face them if seen, then roll closer."""
         with self.control():
+            self._off_charger()
             try:
                 faces = [f for f in self.robot.world.visible_faces]
             except Exception:
@@ -211,6 +243,7 @@ class SmartVector:
     def cuddle(self) -> None:
         """Happy-dog reaction: purr animation + wag with hand (lift) and wheels."""
         with self.control():
+            self._off_charger()
             _wait(self.robot.anim.play_animation_trigger('PettingBlissGetout'))
             for _ in range(3):
                 self.robot.motors.set_lift_motor(4.0)
@@ -224,6 +257,7 @@ class SmartVector:
 
     def wiggle(self) -> None:
         with self.control():
+            self._off_charger()
             for _ in range(2):
                 self.robot.motors.set_wheel_motors(50, -50)
                 time.sleep(0.2)

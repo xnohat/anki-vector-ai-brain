@@ -30,8 +30,9 @@ echo "=== [0/3] Ensuring wire-pod has the Brain bridge ==="
 "$HERE/wirepod-bridge/install.sh" "$WIREPOD_DIR"
 
 echo "=== [1/3] Starting Vector Brain server (port $BRAIN_PORT) ==="
-# Vietnamese STT model: 'small' is a good accuracy/speed balance on a Pi.
-export VECTOR_STT_MODEL="${VECTOR_STT_MODEL:-small}"
+# Fast cloud STT (OpenAI) so the robot's voice request doesn't time out -> the
+# Pi's local Whisper was too slow and caused the "network disconnected" face.
+export VECTOR_STT_BACKEND="${VECTOR_STT_BACKEND:-openai}"
 "$HERE/.venv/bin/python" -u brain_server.py >/tmp/vector-brain.log 2>&1 &
 BRAIN_PID=$!
 echo "    brain server pid $BRAIN_PID (log: /tmp/vector-brain.log)"

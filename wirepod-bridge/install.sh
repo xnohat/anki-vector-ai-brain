@@ -61,7 +61,8 @@ if [ -f "$CFG" ]; then
       -e 's#"provider":"openai"#"provider":"custom"#' \
       -e 's#"provider":"vosk"#"provider":"brain"#' \
       -e "s#\"endpoint\":\"\"#\"endpoint\":\"${BRAIN_V1//#/\\#}\"#" \
-      -e 's#"id":"","model":""#"id":"","model":"gpt-5.5"#' \
+      -e 's#"id":"","model":""#"id":"","model":"gpt-4o"#' \
+      -e 's#"model":"gpt-5.5"#"model":"gpt-4o"#' \
       "$CFG"
     echo "    configured apiConfig.json -> knowledge=custom @ $BRAIN_V1, STT=brain"
 else

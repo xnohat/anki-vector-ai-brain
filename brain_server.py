@@ -37,10 +37,19 @@ from smart import SmartVector
 HOST = os.environ.get("BRAIN_HOST", "127.0.0.1")
 PORT = int(os.environ.get("BRAIN_PORT", "7070"))
 SPEAK_LANG = os.environ.get("VECTOR_LANG", "Vietnamese")
-AGENT_INTERVAL = float(os.environ.get("VECTOR_AGENT_INTERVAL", "75"))
+# STT backend: "openai" (fast cloud, ~1-2s, best for the robot's voice timeout) or
+# "local" (offline Whisper, slower on a Pi). Default openai.
+STT_BACKEND = os.environ.get("VECTOR_STT_BACKEND", "openai").lower()
+STT_API_MODEL = os.environ.get("VECTOR_STT_API_MODEL", "gpt-4o-mini-transcribe")
+STT_API_LANG = os.environ.get("VECTOR_STT_LANG", "vi")
+AGENT_INTERVAL = float(os.environ.get("VECTOR_AGENT_INTERVAL", "150"))
 TOUCH_COOLDOWN = float(os.environ.get("VECTOR_TOUCH_COOLDOWN", "8"))
 VOICE_BACKOFF = float(os.environ.get("VECTOR_VOICE_BACKOFF", "10"))
 AUTONOMOUS = os.environ.get("VECTOR_AUTONOMOUS", "1") not in ("0", "false", "False", "")
+TOUCH_ENABLED = os.environ.get("VECTOR_TOUCH", "1") not in ("0", "false", "False", "")
+# Body = our SDK connection (movement/sensors). Disable to run voice-only (no SDK),
+# which avoids any contention with the robot's voice channel.
+BODY_ENABLED = os.environ.get("VECTOR_BODY", "1") not in ("0", "false", "False", "")
 
 # Action vocabulary the brain can use. Executed by src/smart.py over the SDK.
 ACTIONS = (
@@ -73,12 +82,37 @@ UNIFIED_PROMPT = (
     "up, or a cliff is detected — just emote/talk then."
 )
 
-print("[brain] connecting to Vector + loading brain/whisper/voice ...")
-ROBOT = SmartVector()
+print("[brain] loading brain/whisper/voice ...")
+if BODY_ENABLED:
+    print("[brain] connecting SDK body (movement/sensors) ...")
+    ROBOT = SmartVector()
+else:
+    print("[brain] VOICE-ONLY mode: no SDK body (no movement/sensors)")
+    ROBOT = None
 GPT = CustomGPT(system_prompt=UNIFIED_PROMPT)
-STT = WhisperSTT()
+if STT_BACKEND == "local":
+    STT = WhisperSTT()
+    print("[brain] STT backend: local Whisper")
+else:
+    STT = None
+    print(f"[brain] STT backend: OpenAI {STT_API_MODEL} (fast, lang={STT_API_LANG})")
 VOICE = Voice()
-print(f"[brain] ready: model={GPT.model}, stt={STT.language or 'auto'}")
+print(f"[brain] ready: model={GPT.model}")
+
+
+def transcribe(wav_path: str) -> str:
+    """Speech-to-text. OpenAI API by default (fast enough for the robot's voice
+    timeout); local Whisper if VECTOR_STT_BACKEND=local."""
+    if STT_BACKEND == "local":
+        return (STT.inference(wav_path) or "").strip()
+    try:
+        with open(wav_path, "rb") as f:
+            r = GPT.client.audio.transcriptions.create(
+                model=STT_API_MODEL, file=f, language=STT_API_LANG)
+        return (getattr(r, "text", "") or "").strip()
+    except Exception as exc:
+        print(f"[stt] OpenAI transcribe failed: {exc}")
+        return ""
 
 _TOKEN_RE = re.compile(r"@.*?@")
 _BRAIN_LOCK = threading.Lock()          # serialize GPT calls across threads
@@ -102,6 +136,8 @@ def act_async(reply: str, speak_via_sdk: bool, frame_provider=None):
     commands = parse_commands(reply)
     spoken = clean_spoken(reply)
     silent = any(c.strip().upper() == "SILENT" for c in commands)
+    if ROBOT is None:
+        return spoken  # voice-only: no body, no SDK speech (wire-pod speaks)
 
     # LLM asked to see -> grab a frame and re-ask once.
     if frame_provider and any(c.strip().upper() == "LOOK" for c in commands):
@@ -143,17 +179,21 @@ def agent_loop():
             continue
         if time.time() - _STATE["voice_active"] < VOICE_BACKOFF:
             continue
+        # Don't grab control while the human is interacting (button/touch/held).
+        t, h, b = ROBOT.feel()
+        if t or h or b:
+            continue
         try:
             s = ROBOT.sense()
             prompt = (
                 "[AUTONOMOUS] No one is talking to you. Your senses right now: "
                 + sensors_summary(s) + ". "
-                "Decide what to do as a living robot pet. Mostly be calm, but every "
-                "so often do something delightful and unexpected — look around, roll "
-                "closer to your human and say you missed them, raise your hand, "
-                "wiggle, change eye colour. If a face is visible, you may @APPROACH@. "
-                "If held/picked up/cliff, do NOT move — just emote or speak softly. "
-                "Reply with a short line + action tokens, or exactly @SILENT@."
+                "You are a calm robot pet resting. MOST of the time reply with EXACTLY "
+                "@SILENT@ and nothing else (stay quiet, don't move). Only rarely (about "
+                "1 in 4 beats) do ONE small delightful thing — a quiet look around, a "
+                "gentle eye-colour change, or if a face is visible roll a little closer "
+                "and say one short sweet line. Never be noisy or repetitive. If "
+                "held/picked up/cliff/on charger, do NOT move — @SILENT@ or a soft word."
             )
             with _BRAIN_LOCK:
                 reply = GPT.get_answer(prompt)
@@ -176,9 +216,19 @@ def agent_loop():
 def touch_loop():
     prev_touch = prev_held = False
     last = 0.0
+    last_button = 0.0
     while True:
-        time.sleep(0.25)
-        touched, held = ROBOT.feel()
+        time.sleep(0.05)   # poll fast so we catch the brief button click
+        touched, held, button = ROBOT.feel()
+        now = time.time()
+        if button:
+            last_button = now
+        # Pressing the button also registers as a backpack touch. Suppress touch
+        # reactions for a few seconds around any button press so it can't hijack
+        # the "listen to me" flow with a cuddle.
+        if now - last_button < 6.0:
+            prev_touch, prev_held = touched, held
+            continue
         event = None
         if touched and not prev_touch:
             event = "Người chủ đang vuốt ve lưng (backpack) của bạn."
@@ -254,9 +304,10 @@ class Handler(BaseHTTPRequestHandler):
         try:
             with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tf:
                 tf.write(body); path = tf.name
-            text = (STT.inference(path) or "").strip()
+            t0 = time.time()
+            text = transcribe(path)
             os.unlink(path)
-            print(f"[stt] -> {text!r}")
+            print(f"[stt] ({time.time()-t0:.1f}s) -> {text!r}")
             self._json(200, {"text": text})
         except Exception as exc:
             print(f"[stt] {exc}"); self._json(500, {"error": str(exc)})
@@ -279,7 +330,7 @@ class Handler(BaseHTTPRequestHandler):
 
         frame = None
         low = user.lower()
-        if any(w in low for w in VISION_WORDS):
+        if ROBOT is not None and any(w in low for w in VISION_WORDS):
             frame = ROBOT.get_frame()
         with _BRAIN_LOCK:
             raw = GPT.get_answer(user, image=frame)
@@ -322,8 +373,11 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def _deferred_act(raw):
-    # tiny delay so wire-pod's speech leads, then act the body
-    time.sleep(0.4)
+    if ROBOT is None:
+        return
+    # Wait for wire-pod's spoken reply to finish before grabbing control to move,
+    # so taking SDK control doesn't cut off the robot's speech.
+    time.sleep(float(os.environ.get("VECTOR_ACT_DELAY", "3.5")))
     try:
         act_async(raw, speak_via_sdk=False, frame_provider=ROBOT.get_frame)
     except Exception as exc:
@@ -332,11 +386,12 @@ def _deferred_act(raw):
 
 
 def main():
-    if AUTONOMOUS:
+    if ROBOT is not None and AUTONOMOUS:
         threading.Thread(target=agent_loop, daemon=True).start()
         print(f"[brain] autonomous pet loop ON (every {AGENT_INTERVAL:.0f}s)")
-    threading.Thread(target=touch_loop, daemon=True).start()
-    print("[brain] touch/backpack reactions ON")
+    if ROBOT is not None and TOUCH_ENABLED:
+        threading.Thread(target=touch_loop, daemon=True).start()
+        print("[brain] touch/backpack reactions ON (button press ignored = listen)")
     server = ThreadingHTTPServer((HOST, PORT), Handler)
     print(f"[brain] listening on http://{HOST}:{PORT}  (/stt, /v1)")
     try:
