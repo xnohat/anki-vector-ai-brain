@@ -64,7 +64,7 @@ class SmartVector:
         # behaviour control on the robot for up to ~60s, which makes connect time
         # out. Retry until the robot frees control.
         last_exc = None
-        for attempt in range(8):
+        for attempt in range(3):
             self.robot = anki_vector.AsyncRobot(
                 args.serial,
                 behavior_control_level=ControlPriorityLevel.OVERRIDE_BEHAVIORS_PRIORITY,
@@ -76,14 +76,18 @@ class SmartVector:
                 break
             except Exception as exc:
                 last_exc = exc
-                print(f"[smart] connect attempt {attempt + 1}/8 failed: {exc}; retrying in 12s")
+                print(f"[smart] connect attempt {attempt + 1}/3 failed: {exc}")
                 try:
                     self.robot.disconnect()
                 except Exception:
                     pass
-                time.sleep(12)
+                time.sleep(6)
         if last_exc is not None:
             raise last_exc
+
+    def healthy(self) -> bool:
+        """True if the SDK connection is live (a battery RPC returns)."""
+        return self.battery()[0] is not None
         # CRITICAL: do NOT hold behaviour control while idle, or we fight wire-pod
         # (causes the robot to get stuck in the listening/"thinking" state with a
         # looping noise, and blocks voice/button). Release now; grab only to act.

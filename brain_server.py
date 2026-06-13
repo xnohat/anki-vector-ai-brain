@@ -95,12 +95,19 @@ UNIFIED_PROMPT = (
 )
 
 print("[brain] loading brain/whisper/voice ...")
+ROBOT = None
 if BODY_ENABLED:
-    print("[brain] connecting SDK body (movement/sensors) ...")
-    ROBOT = SmartVector()
+    # Try once at startup, but NEVER block/crash the brain on it — voice (via
+    # wire-pod) must work even if Vector is asleep/unreachable. The body_manager
+    # thread connects + reconnects it in the background when the robot is awake.
+    try:
+        print("[brain] connecting SDK body (movement/sensors) ...")
+        ROBOT = SmartVector()
+    except Exception as exc:
+        print(f"[brain] body not ready ({exc}); brain runs voice-only, will keep retrying")
+        ROBOT = None
 else:
     print("[brain] VOICE-ONLY mode: no SDK body (no movement/sensors)")
-    ROBOT = None
 GPT = CustomGPT(system_prompt=UNIFIED_PROMPT)
 if STT_BACKEND == "local":
     STT = WhisperSTT()
@@ -282,7 +289,7 @@ ALL_TOOL_FNS = {
     "sense": _tool_sense, "look": _tool_look, "act": _tool_act,
     "set_eyes": _tool_set_eyes, "emote": _tool_emote, "vector_intent": _tool_vector_intent,
 }
-_ALL_TOOLS = MEMORY_TOOLS + (BODY_TOOLS if ROBOT is not None else [])
+_ALL_TOOLS = MEMORY_TOOLS + BODY_TOOLS
 GPT.set_tools(_ALL_TOOLS, ALL_TOOL_FNS)
 
 # --- Harness: load the tool catalogue into the system prompt so the brain knows
@@ -507,6 +514,8 @@ def busy() -> bool:
         return True
     if now - _STATE.get("button_ts", 0) < 8:
         return True
+    if ROBOT is None:
+        return False
     try:
         t, h, b = ROBOT.feel()
         return bool(t or h or b)
@@ -601,7 +610,7 @@ def dog_tick(faces: int, on_charger) -> None:
 def autonomous_loop():
     while True:
         time.sleep(AGENT_INTERVAL)
-        if not AUTONOMOUS or busy():
+        if not AUTONOMOUS or ROBOT is None or busy():
             continue
         _TICK["n"] += 1
         try:
@@ -631,6 +640,9 @@ def reflex_loop():
     shake = 0
     while True:
         time.sleep(0.1)
+        if ROBOT is None:                  # body not connected -> wait
+            time.sleep(2)
+            continue
         now = time.time()
         try:
             touched, held, button = ROBOT.feel()
@@ -949,14 +961,47 @@ def dream_loop():
                 pass
 
 
+def body_manager():
+    """Self-healing SDK body: connect when the robot is awake/reachable, and
+    reconnect whenever the connection goes stale (Vector sleeping = zombie session).
+    The brain NEVER hangs on this — voice keeps working throughout."""
+    global ROBOT
+    while True:
+        if not BODY_ENABLED:
+            return
+        if ROBOT is None:
+            try:
+                ROBOT = SmartVector()
+                print("[body] SDK body connected")
+            except Exception:
+                time.sleep(20)            # robot asleep/unreachable -> try later
+                continue
+        time.sleep(15)
+        try:
+            if not ROBOT.healthy():       # stale/zombie connection
+                raise RuntimeError("stale connection")
+        except Exception as exc:
+            print(f"[body] connection lost ({exc}); will reconnect")
+            try:
+                ROBOT.disconnect()
+            except Exception:
+                pass
+            ROBOT = None
+
+
 def main():
-    if ROBOT is not None and AUTONOMOUS:
+    # Loops run always and self-guard on ROBOT being None, so the brain (voice)
+    # never depends on the body being connected.
+    if AUTONOMOUS:
         threading.Thread(target=autonomous_loop, daemon=True).start()
         print(f"[brain] autonomous loop ON (every {AGENT_INTERVAL:.0f}s, model={AUTO_MODEL})")
-    threading.Thread(target=dream_loop, daemon=True).start()
-    if ROBOT is not None and TOUCH_ENABLED:
+    if TOUCH_ENABLED:
         threading.Thread(target=reflex_loop, daemon=True).start()
         print("[brain] reflex loop ON (cliff-safety, pickup/shake/flip/touch/battery)")
+    if BODY_ENABLED:
+        threading.Thread(target=body_manager, daemon=True).start()
+        print("[brain] body manager ON (auto-connect/reconnect, never blocks voice)")
+    threading.Thread(target=dream_loop, daemon=True).start()
     server = ThreadingHTTPServer((HOST, PORT), Handler)
     print(f"[brain] listening on http://{HOST}:{PORT}  (/stt, /v1)")
     try:
