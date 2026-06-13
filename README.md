@@ -73,11 +73,22 @@ pip install -r requirements.txt
 pip install -e vector-python-sdk/
 ```
 
-## Run sample
+## Run
+
+Start everything (brain server + Vector's-mic voice bridge via wire-pod):
 
 ```sh
-python3 app.py
+./run.sh
 ```
+
+Then say **"Hey Vector, …(tiếng Việt)"**. Other modes:
+
+```sh
+./run.sh --no-pod   # brain server only (e.g. to test /stt and /v1)
+./run.sh --sdk      # legacy standalone SDK app (app.py: text/USB-mic, agent loop, touch)
+```
+
+See `BRIDGE_SETUP.md` for the full architecture.
 
 ### Performance Notes
 

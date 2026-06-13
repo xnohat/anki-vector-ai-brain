@@ -69,4 +69,4 @@ else
     echo "          OpenAI key in the wire-pod web UI), then re-run this installer."
 fi
 
-echo "=== done. Run the bridge with:  ../run_bridge.sh ==="
+echo "=== done. Run the bridge with:  ../run.sh ==="

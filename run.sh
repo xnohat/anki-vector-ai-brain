@@ -1,58 +1,63 @@
 #!/bin/bash
-# Launcher script for Vector Advanced AI
-# Automatically activates virtual environment and runs the app
+# Vector Brain — start EVERYTHING with one command.
+#
+# Flow when you say "Hey Vector, <Vietnamese>":
+#   Vector mic -> wire-pod (VAD) -> our /stt (sensitive VN Whisper)
+#             -> wire-pod intent match (native Vector Intents) OR our /v1 brain
+#             -> Vector speaks Vietnamese (OpenAI voice) + animates (intents)
+#
+# Usage:  ./run.sh             (brain server + wire-pod brain bridge)
+#         ./run.sh --no-pod    (brain server only)
+#         ./run.sh --sdk       (legacy standalone SDK app: app.py)
+set -e
+HERE="$(cd "$(dirname "$0")" && pwd)"
+WIREPOD_DIR="${WIREPOD_DIR:-$HOME/wire-pod}"
+CHIPPER="$WIREPOD_DIR/chipper"
+BRAIN_PORT="${BRAIN_PORT:-7070}"
 
-cd "$(dirname "$0")"
+cd "$HERE"
+[ -d .venv ] || { echo "No .venv — run: python3 -m venv .venv && .venv/bin/pip install -r requirements.txt"; exit 1; }
+[ -f .env ] && { set -a; . ./.env; set +a; }
 
-echo "=========================================="
-echo "   Vector Advanced AI - Launcher"
-echo "=========================================="
-echo
-
-# Check if virtual environment exists
-if [ ! -d ".venv" ]; then
-    echo "Virtual environment not found. Creating one..."
-    python3 -m venv .venv
-    source .venv/bin/activate
-    echo "Installing dependencies..."
-    pip install -r requirements.txt
-    pip install -e vector-python-sdk/
-else
-    source .venv/bin/activate
+# Legacy standalone SDK app (wake-word/text app via the SDK; no wire-pod).
+if [ "$1" == "--sdk" ]; then
+    echo "=== Starting standalone SDK app (app.py) ==="
+    exec "$HERE/.venv/bin/python" app.py
 fi
 
-# Load .env if present (so OPENAI_API_KEY / VECTOR_GPT_MODEL can live in a file)
-if [ -f ".env" ]; then
-    set -a
-    # shellcheck disable=SC1091
-    source .env
-    set +a
-fi
+echo "=== [0/3] Ensuring wire-pod has the Brain bridge ==="
+# Applies our bundled bridge onto (upstream) wire-pod. No fork to maintain.
+"$HERE/wirepod-bridge/install.sh" "$WIREPOD_DIR"
 
-# Check for OpenAI API key
-if [ -z "$OPENAI_API_KEY" ]; then
-    echo "⚠️  WARNING: OPENAI_API_KEY not set!"
-    echo
-    echo "The app requires an OpenAI API key for ChatGPT and Whisper."
-    echo "Set it with:"
-    echo "  export OPENAI_API_KEY='your-api-key-here'"
-    echo
-    echo "Or add to ~/.bashrc for permanent setup:"
-    echo "  echo \"export OPENAI_API_KEY='your-key'\" >> ~/.bashrc"
-    echo
-    read -p "Continue anyway? (y/n) " -n 1 -r
-    echo
-    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-        exit 1
+echo "=== [1/3] Starting Vector Brain server (port $BRAIN_PORT) ==="
+# Vietnamese STT model: 'small' is a good accuracy/speed balance on a Pi.
+export VECTOR_STT_MODEL="${VECTOR_STT_MODEL:-small}"
+"$HERE/.venv/bin/python" brain_server.py >/tmp/vector-brain.log 2>&1 &
+BRAIN_PID=$!
+echo "    brain server pid $BRAIN_PID (log: /tmp/vector-brain.log)"
+
+echo "    waiting for brain to be ready..."
+until curl -s --max-time 3 "http://127.0.0.1:$BRAIN_PORT/health" >/dev/null 2>&1; do
+    if ! kill -0 "$BRAIN_PID" 2>/dev/null; then
+        echo "    ERROR: brain server died. See /tmp/vector-brain.log"; exit 1
     fi
+    sleep 2
+done
+echo "    brain server is up."
+
+if [ "$1" == "--no-pod" ]; then
+    echo "=== brain only (--no-pod). Ctrl+C to stop. ==="
+    wait "$BRAIN_PID"; exit 0
 fi
 
-# Run the app
-echo
-echo "Starting Vector Advanced AI..."
-echo "- Object Detection: YOLOv8 (fast mode)"
-echo "- Speech Recognition: Whisper"
-echo "- AI Brain: ${VECTOR_GPT_MODEL:-gpt-5.5} (vision-enabled)"
-echo
-python app.py
+echo "=== [2/3] Stopping any running wire-pod ==="
+sudo pkill -x chipper 2>/dev/null || true
+sudo pkill -f "cmd/brain/main.go" 2>/dev/null || true
+sudo pkill -f "cmd/vosk/main.go" 2>/dev/null || true
+sudo pkill -f "chipper/start.sh" 2>/dev/null || true
+sudo pkill -f "/tmp/go-build.*chipper" 2>/dev/null || true
+sleep 2
 
+echo "=== [3/3] Starting wire-pod Brain bridge (needs sudo for port 443) ==="
+cd "$CHIPPER"
+exec sudo -E STT_SERVICE=brain BRAIN_STT_URL="http://127.0.0.1:$BRAIN_PORT/stt" ./start.sh

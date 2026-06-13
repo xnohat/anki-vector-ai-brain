@@ -32,7 +32,7 @@ using our own sensitive Vietnamese Whisper instead of wire-pod's STT.
 | `wirepod-bridge/stt_brain/Brain.go` | **bundled** STT service → posts Vector mic audio to `/stt` |
 | `wirepod-bridge/cmd_brain/main.go` | **bundled** entrypoint for the bridge build |
 | `wirepod-bridge/install.sh` | applies the bundle onto an upstream wire-pod (no fork) |
-| `run_bridge.sh` (our project) | one-command unified launcher (installs bridge + runs) |
+| `run.sh` (our project) | one-command unified launcher (installs bridge + runs) |
 
 The bridge code lives **inside this project** (`wirepod-bridge/`). `install.sh`
 copies it onto an upstream wire-pod checkout and edits that checkout's
@@ -45,7 +45,7 @@ maintain** — pull upstream and re-run `install.sh`.
 
 ```sh
 cd ~/vector-advanced-ai
-./run_bridge.sh
+./run.sh
 ```
 
 This (0) installs/updates the bridge into `~/wire-pod`, (1) starts the brain

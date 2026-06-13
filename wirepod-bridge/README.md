@@ -19,7 +19,7 @@ checkout and points it at our brain server.
 ```sh
 ./install.sh [WIREPOD_DIR]     # default ~/wire-pod
 ```
-Then run everything from the project root with `../run_bridge.sh`.
+Then run everything from the project root with `../run.sh`.
 
 ## Why a bridge?
 On this firmware the SDK's `AudioFeed` is a stub (a 1 kHz test tone), so the only
