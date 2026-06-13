@@ -354,9 +354,16 @@ VISION_WORDS = ("thấy", "nhìn", "xem", "see", "look", "đọc", "màu", "ai "
                 "what", "who", "camera", "trước mặt")
 
 
+_EMOJI_RE = re.compile(
+    "[\U0001F000-\U0001FAFF\U00002600-\U000027BF\U00002190-\U000021FF"
+    "\U00002B00-\U00002BFF\U0000FE00-\U0000FE0F\U0001F1E6-\U0001F1FF\U00002702-\U000027B0]+",
+    flags=re.UNICODE)
+
+
 def clean_spoken(text: str) -> str:
     text = _TOKEN_RE.sub("", text)
     text = re.sub(r"\*(.*?)\*", "", text)
+    text = _EMOJI_RE.sub("", text)            # never speak emojis
     return re.sub(r"\s+", " ", text).strip()
 
 
@@ -426,7 +433,8 @@ def act_async(reply: str, speak_via_sdk: bool, frame_provider=None, allow_move=T
 # Concise action vocab for cheap, low-token autonomous/reflex prompts.
 SHORT_ACTIONS = (
     "Add inline action tokens (the app runs them and strips them from speech). "
-    "Movement: @APPROACH@ @FINDME@ @CUDDLE@ @WIGGLE@ @DANCE@ @RAISEHAND@ @LOOKAROUND@. "
+    "Movement & dog things: @APPROACH@ @NUZZLE@ @FINDME@ @CUDDLE@ @WIGGLE@ @DANCE@ "
+    "@SPIN@(zoomies) @HEADTILT@(curious) @BEG@ @PERKUP@ @RAISEHAND@ @LOOKAROUND@. "
     "Emotion, pick ONE: @EMOTE_happy@ @EMOTE_love@ @EMOTE_surprised@ @EMOTE_celebrate@ "
     "@EMOTE_angry@ @EMOTE_sad@ @EMOTE_confused@. "
     "Eyes, pick ONE: @EYE_love@ @EYE_happy@ @EYE_curious@ @EYE_calm@ @EYE_angry@. "
@@ -467,7 +475,8 @@ def _react_sys() -> str:
             "what happened and SURPRISING: exclaim, tease, be ticklish, dizzy, delighted "
             "or indignant. NEVER generic, NEVER just 'thank you' or 'save me', and never "
             "repeat yourself. Address your human by name if you know it. Always include a "
-            "fitting @EMOTE_@ and @EYE_@, and a body action when it fits.\n" + SHORT_ACTIONS
+            "fitting emotion + eye-colour token and a body action when it fits. No "
+            "emojis, no asterisks.\n" + SHORT_ACTIONS
         )
     return _REACT_SYS
 
@@ -537,10 +546,56 @@ def curiosity_explore():
 
 
 # --------------------------------------------------------------------------- #
-# Autonomous loop — cheap model, every ~15s, mostly silent, never interrupts.
+# Autonomous loop — a lively, surprising playful-dog pet (personality + memory).
 # Occasionally Vector gets curious and explores/learns about his world.
 # --------------------------------------------------------------------------- #
 _TICK = {"n": 0}
+_DOG_SYS = None
+_RECENT = []   # last few autonomous lines, so he doesn't repeat himself
+
+
+def _dog_sys() -> str:
+    global _DOG_SYS
+    if _DOG_SYS is None:
+        _DOG_SYS = (
+            MEMORY.identity() + "\n\n"
+            "You are a real, playful, loving robot DOG-pet. In quiet moments you do "
+            "little things ON YOUR OWN — spontaneous, SURPRISING and delightful, full "
+            f"of personality, NEVER repetitive. Reply in {SPEAK_LANG}: ONE short line "
+            "(or @SILENT@) plus fitting action tokens. Address your human by name when "
+            "you can. No emojis, no asterisks.\n" + SHORT_ACTIONS
+        )
+    return _DOG_SYS
+
+
+def dog_tick(faces: int, on_charger) -> None:
+    """One lively, surprising playful-dog moment."""
+    recent = "; ".join(_RECENT[-4:])
+    sit = (
+        f"A quiet moment. human_in_sight={faces > 0}, on_charger={on_charger}. "
+        "Do ONE spontaneous DOG thing now and a short line — pick something DIFFERENT "
+        "from recently and surprise me: curious head-tilt @HEADTILT@, ears-up @PERKUP@, "
+        "happy zoomies @SPIN@, wag @CUDDLE@/@WIGGLE@, sit up & beg @BEG@, dance @DANCE@, "
+        "look around @LOOKAROUND@, change eye colour, or murmur something sweet/sassy. "
+        "If your human is in sight and you're NOT on charger you may roll over and nuzzle "
+        "@NUZZLE@ with a loving line. If on charger or no human: don't drive — head-tilt/"
+        "emote/talk only. About 1 in 3 times just rest (@SILENT@)."
+        + (f"\n\nRecently you already did/said: {recent} — do NOT repeat these." if recent else "")
+    )
+    try:
+        r = GPT.client.chat.completions.create(
+            model=REACT_MODEL, max_tokens=90, temperature=1.2,
+            messages=[{"role": "system", "content": _dog_sys()},
+                      {"role": "user", "content": sit}])
+        reply = (r.choices[0].message.content or "@SILENT@").strip()
+    except Exception as exc:
+        print(f"[auto] {exc}")
+        return
+    said = act_async(reply, speak_via_sdk=True, allow_move=(faces > 0 and not on_charger))
+    if said:
+        _RECENT.append(said)
+        del _RECENT[:-6]
+        print(f"[auto] {said}")
 
 
 def autonomous_loop():
@@ -552,18 +607,10 @@ def autonomous_loop():
         try:
             faces = ROBOT.sense().get("faces_visible", 0)
             _, charging, on_charger = ROBOT.battery()
-            # every Nth idle tick: be curious — look at the world and learn.
-            if _TICK["n"] % CURIOSITY_EVERY == 0:
+            if _TICK["n"] % CURIOSITY_EVERY == 0:   # sometimes look + learn
                 curiosity_explore()
-                continue
-            sit = (f"You are resting. on_charger={on_charger}, face_seen={faces > 0}. "
-                   "Usually reply @SILENT@. About 1 in 5 times do ONE tiny delightful "
-                   "thing: look around, a gentle eye colour, or (only if a face is seen "
-                   "and NOT on charger) roll a bit closer + one short sweet line.")
-            reply = light_reply(sit)
-            said = act_async(reply, speak_via_sdk=True, allow_move=(faces > 0 and not on_charger))
-            if said:
-                print(f"[auto] {said}")
+            else:                                    # otherwise a playful-dog moment
+                dog_tick(faces, on_charger)
         except Exception as exc:
             print(f"[auto] tick failed: {exc}")
 

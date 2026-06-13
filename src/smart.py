@@ -412,6 +412,44 @@ class SmartVector:
             self.robot.motors.set_wheel_motors(0, 0)
             self.robot.motors.set_lift_motor(0)
 
+    # ------------------------------------------------------------ dog things
+    def head_tilt(self) -> None:
+        """Curious puppy head-tilt + look."""
+        with self.control():
+            _wait(self.robot.behavior.set_head_angle(degrees(20)))
+            _wait(self.robot.anim.play_animation_trigger('MeetVictorConfusion'))
+            _wait(self.robot.behavior.set_head_angle(degrees(5)))
+
+    def spin(self) -> None:
+        """Excited zoomies — a happy spin in place."""
+        with self.control():
+            self._off_charger()
+            _wait(self.robot.behavior.set_eye_color(hue=0.2, saturation=1.0))
+            _wait(self.robot.behavior.turn_in_place(degrees(360)))
+
+    def nuzzle(self) -> None:
+        """Roll up to the human and nuzzle/bump affectionately."""
+        self.approach()
+        with self.control():
+            self._drive_safe(55, 55, 0.4)
+            _wait(self.robot.anim.play_animation_trigger('PettingBlissGetout'))
+            _wait(self.robot.behavior.set_head_angle(degrees(30)))
+
+    def beg(self) -> None:
+        """Sit up and beg — lift up, head up, hold, then down."""
+        with self.control():
+            _wait(self.robot.behavior.set_head_angle(degrees(40)))
+            _wait(self.robot.behavior.set_lift_height(1.0))
+            time.sleep(0.7)
+            _wait(self.robot.behavior.set_lift_height(0.3))
+
+    def perk_up(self) -> None:
+        """Ears-up alert: head up, bright curious eyes, a listening perk."""
+        with self.control():
+            _wait(self.robot.behavior.set_head_angle(degrees(40)))
+            _wait(self.robot.behavior.set_eye_color(hue=0.75, saturation=1.0))
+            _wait(self.robot.anim.play_animation_trigger('KnowledgeGraphListening'))
+
     def wiggle(self) -> None:
         with self.control():
             self._off_charger()
@@ -445,6 +483,16 @@ class SmartVector:
                 self.look_around()
             elif c.startswith('WIGGLE'):
                 self.wiggle()
+            elif c.startswith('HEADTILT'):
+                self.head_tilt()
+            elif c.startswith('SPIN') or c.startswith('ZOOMIES'):
+                self.spin()
+            elif c.startswith('NUZZLE'):
+                self.nuzzle()
+            elif c.startswith('BEG'):
+                self.beg()
+            elif c.startswith('PERKUP'):
+                self.perk_up()
             elif c.startswith('DANCE'):
                 self.dance()
             elif c.startswith('CHARGE') or c.startswith('GOCHARGE'):
