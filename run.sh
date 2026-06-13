@@ -8,7 +8,6 @@
 #
 # Usage:  ./run.sh             (brain server + wire-pod brain bridge)
 #         ./run.sh --no-pod    (brain server only)
-#         ./run.sh --sdk       (legacy standalone SDK app: app.py)
 set -e
 HERE="$(cd "$(dirname "$0")" && pwd)"
 WIREPOD_DIR="${WIREPOD_DIR:-$HOME/wire-pod}"
@@ -18,12 +17,6 @@ BRAIN_PORT="${BRAIN_PORT:-7070}"
 cd "$HERE"
 [ -d .venv ] || { echo "No .venv — run: python3 -m venv .venv && .venv/bin/pip install -r requirements.txt"; exit 1; }
 [ -f .env ] && { set -a; . ./.env; set +a; }
-
-# Legacy standalone SDK app (wake-word/text app via the SDK; no wire-pod).
-if [ "$1" == "--sdk" ]; then
-    echo "=== Starting standalone SDK app (app.py) ==="
-    exec "$HERE/.venv/bin/python" app.py
-fi
 
 echo "=== [0/3] Ensuring wire-pod has the Brain bridge ==="
 # Applies our bundled bridge onto (upstream) wire-pod. No fork to maintain.

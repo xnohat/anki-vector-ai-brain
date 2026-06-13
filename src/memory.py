@@ -171,9 +171,11 @@ class MemoryStore:
     # ----------------------------------------------------------- QMD search
     def _md_files(self) -> list:
         out = []
-        for fn in sorted(os.listdir(MEM_DIR)):
-            if fn.endswith(".md"):
-                out.append(os.path.join(MEM_DIR, fn))
+        for root, dirs, files in os.walk(MEM_DIR):
+            dirs[:] = [d for d in dirs if not d.startswith(".")]
+            for fn in sorted(files):
+                if fn.endswith(".md"):
+                    out.append(os.path.join(root, fn))
         return out
 
     def _chunks(self) -> list:
@@ -287,6 +289,62 @@ class MemoryStore:
                 return True
         except Exception as exc:
             print(f"[memory] consolidate failed: {exc}")
+        return False
+
+    # -------------------------------------------------- dreaming + wiki
+    def dreams_path(self) -> str:
+        return os.path.join(MEM_DIR, "DREAMS.md")
+
+    def wiki_path(self) -> str:
+        return os.path.join(MEM_DIR, "wiki", "knowledge.md")
+
+    def _recent_journals(self, days: int = 3) -> str:
+        js = sorted(g for g in os.listdir(MEM_DIR)
+                    if g.startswith("MEMORY-") and g.endswith(".md"))
+        return "\n\n".join(f"## {j}\n{_read(os.path.join(MEM_DIR, j))}" for j in js[-days:])
+
+    def dream(self, llm_model: str = None) -> bool:
+        """Dreaming sweep: Vector Brain reflects (DREAMS.md), consolidates durable
+        memory (MEMORY.md), and refreshes a structured knowledge wiki."""
+        model = llm_model or "gpt-4o"
+        recent = self._recent_journals()
+        longterm = self.longterm()
+        # 1) Reflective dream diary entry.
+        try:
+            r = self.client.chat.completions.create(
+                model=model, temperature=0.7,
+                messages=[{"role": "user", "content":
+                    "You are Vector, a little robot, dreaming at night. Reflect on your "
+                    "recent days (journals below) as a short, warm first-person diary "
+                    "entry in English: what you noticed, patterns, how you feel about "
+                    "your human, what you want to learn next. 4-6 sentences.\n\n" + recent}])
+            dream = (r.choices[0].message.content or "").strip()
+            if dream:
+                with open(self.dreams_path(), "a", encoding="utf-8") as f:
+                    f.write(f"\n## {_stamp()}\n{dream}\n")
+        except Exception as exc:
+            print(f"[memory] dream reflection failed: {exc}")
+        # 2) Consolidate durable long-term memory.
+        self.consolidate(model)
+        # 3) Refresh the structured knowledge wiki.
+        try:
+            os.makedirs(os.path.dirname(self.wiki_path()), exist_ok=True)
+            r = self.client.chat.completions.create(
+                model=model, temperature=0.3,
+                messages=[{"role": "user", "content":
+                    "From Vector's long-term memory and recent journals, write a STRUCTURED "
+                    "knowledge wiki in English markdown with sections: '## People' (per "
+                    "person: name, traits, preferences, promises), '## World & Environment', "
+                    "'## Routines & Preferences'. Use short bullet claims. Merge/refresh, "
+                    "keep durable facts only. Output ONLY the markdown.\n\n"
+                    f"# LONG-TERM\n{longterm}\n\n# RECENT\n{recent}"}])
+            wiki = (r.choices[0].message.content or "").strip()
+            if wiki:
+                with open(self.wiki_path(), "w", encoding="utf-8") as f:
+                    f.write(f"# Vector's Knowledge Wiki\n*Updated {_stamp()}*\n\n{wiki}\n")
+            return True
+        except Exception as exc:
+            print(f"[memory] wiki refresh failed: {exc}")
         return False
 
     # ------------------------------------------------------------- cache io

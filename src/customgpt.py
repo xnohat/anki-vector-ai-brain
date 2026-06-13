@@ -59,6 +59,8 @@ class CustomGPT:
     def __init__(self, model: str = DEFAULT_MODEL, system_prompt: str = None) -> None:
         self.client = OpenAI()
         self.model = model
+        self.tools = None         # OpenAI tool specs the brain may call
+        self.tool_fns = {}        # name -> callable(args_dict) -> str
 
         if system_prompt is not None:
             self.system_prompt = system_prompt
@@ -134,12 +136,36 @@ class CustomGPT:
             return
         self.messages = [self.messages[0]] + self.messages[-MAX_HISTORY_MESSAGES:]
 
+    def set_tools(self, tool_specs: list, tool_fns: dict) -> None:
+        """Register OpenAI tool specs + their implementations so the brain can
+        actively call them (e.g. memory_search, memory_get)."""
+        self.tools = tool_specs
+        self.tool_fns = tool_fns or {}
+
+    def _run_tool(self, name: str, arguments: str) -> str:
+        import json as _json
+        try:
+            args = _json.loads(arguments or "{}")
+        except Exception:
+            args = {}
+        fn = self.tool_fns.get(name)
+        if not fn:
+            return f"(unknown tool {name})"
+        try:
+            out = fn(args)
+            return str(out) if out else "(no result)"
+        except Exception as exc:
+            return f"(tool {name} error: {exc})"
+
     # ------------------------------------------------------------------ #
     # main entry point
     # ------------------------------------------------------------------ #
-    def get_answer(self, query: str, image: PIL.Image.Image = None, memories: str = None) -> str:
+    def get_answer(self, query: str, image: PIL.Image.Image = None, memories: str = None,
+                   use_tools: bool = True) -> str:
         """Get Vector's reply. If `image` is given, Vector sees it as his eyes.
-        `memories` (recalled long-term memory) is injected for THIS call only."""
+        `memories` (recalled long-term memory) is injected for THIS call only.
+        use_tools=False skips the tool round-trips (faster — for the voice path,
+        where the harness already injects live sensors + memory)."""
         if not query and image is None:
             return ""
 
@@ -156,19 +182,36 @@ class CustomGPT:
 
         # Inject recalled long-term memory as a transient system note (this call
         # only — not stored in history, so context stays clean and bounded).
-        call_messages = self.messages
+        call_messages = list(self.messages)
         if memories:
             mem_msg = {"role": "system",
                        "content": "Your relevant memories (use if helpful):\n" + memories}
-            call_messages = self.messages[:-1] + [mem_msg] + self.messages[-1:]
+            call_messages = call_messages[:-1] + [mem_msg] + call_messages[-1:]
 
         try:
-            chat = self.client.chat.completions.create(
-                model=self.model,
-                temperature=1.0,
-                messages=call_messages,
-            )
-            reply = chat.choices[0].message.content or ""
+            reply = ""
+            # Agentic tool loop: the brain can CALL memory_search / memory_get to
+            # actively look things up mid-thought, then finish its answer.
+            for _ in range(4):
+                kwargs = dict(model=self.model, temperature=1.0, messages=call_messages)
+                if use_tools and self.tools:
+                    kwargs["tools"] = self.tools
+                chat = self.client.chat.completions.create(**kwargs)
+                msg = chat.choices[0].message
+                if getattr(msg, "tool_calls", None):
+                    call_messages.append({
+                        "role": "assistant", "content": msg.content or "",
+                        "tool_calls": [{"id": tc.id, "type": "function",
+                                        "function": {"name": tc.function.name,
+                                                     "arguments": tc.function.arguments}}
+                                       for tc in msg.tool_calls]})
+                    for tc in msg.tool_calls:
+                        out = self._run_tool(tc.function.name, tc.function.arguments)
+                        call_messages.append({"role": "tool", "tool_call_id": tc.id,
+                                              "content": out})
+                    continue
+                reply = msg.content or ""
+                break
         except Exception as exc:
             print(f"[customgpt] model call failed: {exc}")
             # Drop the failed user turn so we don't resend a broken/huge payload.
@@ -183,6 +226,49 @@ class CustomGPT:
         self.messages.append({"role": "assistant", "content": reply})
         self._trim_history()
         return reply
+
+    def stream_answer(self, query: str, image: PIL.Image.Image = None, memories: str = None):
+        """Generator: stream Vector's reply token-by-token (fast first word for the
+        voice path). No tools. Stores the full reply in history; the full text is
+        left in self.last_full for the caller to parse @COMMAND@ tokens."""
+        self.last_full = ""
+        if not query and image is None:
+            return
+        if image is not None:
+            user_content = [
+                {"type": "text", "text": query or "What do you see right now?"},
+                {"type": "image_url", "image_url": {"url": self._encode_image(image)}},
+            ]
+        else:
+            user_content = query
+        self.messages.append({"role": "user", "content": user_content})
+        call_messages = list(self.messages)
+        if memories:
+            mem_msg = {"role": "system",
+                       "content": "Your relevant memories (use if helpful):\n" + memories}
+            call_messages = call_messages[:-1] + [mem_msg] + call_messages[-1:]
+
+        full = ""
+        try:
+            stream = self.client.chat.completions.create(
+                model=self.model, temperature=1.0, messages=call_messages, stream=True)
+            for chunk in stream:
+                try:
+                    delta = chunk.choices[0].delta.content
+                except Exception:
+                    delta = None
+                if delta:
+                    full += delta
+                    yield delta
+        except Exception as exc:
+            print(f"[customgpt] stream failed: {exc}")
+            self.messages.pop()
+            return
+        if image is not None:
+            self.messages[-1]["content"] = (query or "What do you see right now?") + " [camera image]"
+        self.messages.append({"role": "assistant", "content": full})
+        self._trim_history()
+        self.last_full = full
 
     def autonomous_tick(self, state: dict) -> str:
         """One beat of the autonomous agent loop.

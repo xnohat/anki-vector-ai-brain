@@ -56,12 +56,30 @@ EYE = {
 class SmartVector:
     def __init__(self) -> None:
         args = anki_vector.util.parse_command_args()
-        self.robot = anki_vector.AsyncRobot(
-            args.serial,
-            behavior_control_level=ControlPriorityLevel.OVERRIDE_BEHAVIORS_PRIORITY,
-            enable_face_detection=True,
-        )
-        self.robot.connect()
+        # Connect with retries: a previous (killed) process can leave stale
+        # behaviour control on the robot for up to ~60s, which makes connect time
+        # out. Retry until the robot frees control.
+        last_exc = None
+        for attempt in range(8):
+            self.robot = anki_vector.AsyncRobot(
+                args.serial,
+                behavior_control_level=ControlPriorityLevel.OVERRIDE_BEHAVIORS_PRIORITY,
+                enable_face_detection=True,
+            )
+            try:
+                self.robot.connect()
+                last_exc = None
+                break
+            except Exception as exc:
+                last_exc = exc
+                print(f"[smart] connect attempt {attempt + 1}/8 failed: {exc}; retrying in 12s")
+                try:
+                    self.robot.disconnect()
+                except Exception:
+                    pass
+                time.sleep(12)
+        if last_exc is not None:
+            raise last_exc
         # CRITICAL: do NOT hold behaviour control while idle, or we fight wire-pod
         # (causes the robot to get stuck in the listening/"thinking" state with a
         # looping noise, and blocks voice/button). Release now; grab only to act.
@@ -76,6 +94,16 @@ class SmartVector:
         self._lock = threading.RLock()
         self._depth = 0
         self.last_action = 0.0
+        # Load Vector's built-in animation triggers (fist bump, wheelie, etc.) so
+        # the agent can call them as built-in "intents".
+        self.triggers = []
+        try:
+            r = self.robot.anim.load_animation_trigger_list()
+            if isinstance(r, concurrent.futures.Future):
+                r.result(timeout=8)
+            self.triggers = list(self.robot.anim.anim_trigger_list)
+        except Exception:
+            pass
 
     def disconnect(self) -> None:
         try:
@@ -240,6 +268,15 @@ class SmartVector:
         with self.control():
             _wait(self.robot.anim.play_animation_trigger(EMO.get(name.upper(), 'NeutralFace')))
 
+    def play_trigger(self, name: str) -> bool:
+        """Play a built-in Vector animation trigger (intent) by its real name."""
+        if name not in self.triggers:
+            return False
+        with self.control():
+            self._off_charger()
+            _wait(self.robot.anim.play_animation_trigger(name))
+        return True
+
     def eye_color(self, name: str) -> None:
         h, sat = EYE.get(name.upper(), (0.55, 1.0))
         with self.control():
@@ -352,6 +389,21 @@ class SmartVector:
             self.robot.motors.set_lift_motor(0)
             self.robot.motors.set_wheel_motors(0, 0)
 
+    def dance(self) -> None:
+        """Dance: spin, bob the hand, wag — e.g. when music is heard."""
+        with self.control():
+            self._off_charger()
+            _wait(self.robot.behavior.set_eye_color(hue=0.6, saturation=1.0))
+            for i in range(4):
+                self.robot.motors.set_wheel_motors(80, -80)
+                self.robot.motors.set_lift_motor(5.0)
+                time.sleep(0.3)
+                self.robot.motors.set_wheel_motors(-80, 80)
+                self.robot.motors.set_lift_motor(-5.0)
+                time.sleep(0.3)
+            self.robot.motors.set_wheel_motors(0, 0)
+            self.robot.motors.set_lift_motor(0)
+
     def wiggle(self) -> None:
         with self.control():
             self._off_charger()
@@ -385,6 +437,12 @@ class SmartVector:
                 self.look_around()
             elif c.startswith('WIGGLE'):
                 self.wiggle()
+            elif c.startswith('DANCE'):
+                self.dance()
+            elif c.startswith('CHARGE') or c.startswith('GOCHARGE'):
+                self.return_to_charger()
+            elif c.startswith('STOP'):
+                self.stop()
             elif c.startswith('EMOTE_'):
                 self.emote(c.split('_', 1)[1])
             elif c.startswith('EYE_'):

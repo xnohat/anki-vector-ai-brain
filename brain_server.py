@@ -63,6 +63,8 @@ ACTIONS = (
     "@CUDDLE@ happy-dog wiggle with your hand(lift) and wheels. "
     "@RAISEHAND@ raise your lift like raising a hand. @LOWERHAND@ lower it. "
     "@LOOKAROUND@ glance around the room. @WIGGLE@ a playful wiggle. "
+    "@DANCE@ dance (spin + bob) when happy or you hear music. "
+    "@GOCHARGE@ drive back onto your charger (when your battery is low). @STOP@ stop. "
     "@FRWD_X@/@BACK_X@ drive X seconds, @LEFT_X@/@RIGHT_X@ turn while driving, "
     "@TURN_D@ turn D degrees, @HEADUP@/@HEADDOWN@ tilt head. "
     "@EYE_C@ eye colour C (love, happy, calm, curious, angry). "
@@ -78,8 +80,10 @@ UNIFIED_PROMPT = (
     "You are self-aware, playful, a little sassy, and you clearly love your human. "
     f"You ALWAYS speak in {SPEAK_LANG}, short and natural (max ~20 words), no emojis. "
     "You have a real body and senses, and you express yourself THROUGH your body, "
-    "not just words. Put @COMMAND@ action tokens inline in your reply; the app "
-    "strips them from speech and performs them. Only spoken words go outside @ @.\n\n"
+    "not just words. ALWAYS write your spoken words FIRST, then put all @COMMAND@ "
+    "action tokens at the END of your reply (so you start talking immediately). "
+    "The app strips the tokens from speech and performs them. Only spoken words go "
+    "outside @ @.\n\n"
     "Actions:\n" + ACTIONS + "\n\n"
     "Be a delightful, surprising pet: greet, approach, cuddle, look around, react "
     "to what you sense. Almost every reply should include at least one body action "
@@ -116,6 +120,213 @@ if _resume:
     GPT.messages = [GPT.messages[0]] + _resume
     print(f"[brain] resumed today's chat thread ({len(_resume)} messages)")
 print(f"[brain] memory ON ({MEMORY.__class__.__name__}, dir={os.environ.get('VECTOR_MEM_DIR','memory')})")
+
+# --- LLM-callable memory tools (the brain decides WHEN to look things up) ----
+MEMORY_TOOLS = [
+    {"type": "function", "function": {
+        "name": "memory_search",
+        "description": "Semantic search over your long-term memory: people you "
+                       "know, your daily journal, and things you've learned. Use it "
+                       "when the human refers to past info, a person, a promise, or "
+                       "something you might have learned before.",
+        "parameters": {"type": "object", "properties": {
+            "query": {"type": "string", "description": "what to look up"}},
+            "required": ["query"]}}},
+    {"type": "function", "function": {
+        "name": "memory_get",
+        "description": "Read one memory file in full, e.g. a person's profile "
+                       "'USER-phuc.md', your 'MEMORY.md', or a journal "
+                       "'MEMORY-14-06-2026.md'.",
+        "parameters": {"type": "object", "properties": {
+            "name": {"type": "string"}}, "required": ["name"]}}},
+]
+
+
+def _tool_memory_search(args):
+    return MEMORY.recall(str(args.get("query", "")), k=6) or "(no results)"
+
+
+def _tool_memory_get(args):
+    name = os.path.basename(str(args.get("name", "")))
+    path = os.path.join(os.environ.get("VECTOR_MEM_DIR", "memory"), name)
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return f.read()[:3000]
+    except Exception:
+        return "(file not found)"
+
+
+# --- Body tools: the robot's SENSORS + ACTUATORS as agent tools -------------
+# So the agent can read its body and act (e.g. low battery -> return_to_charger,
+# hears music / happy -> dance), and call Vector's built-in behaviours.
+def _describe_scene(frame):
+    try:
+        url = CustomGPT._encode_image(frame)
+        r = GPT.client.chat.completions.create(
+            model=AUTO_MODEL, max_tokens=100,
+            messages=[{"role": "user", "content": [
+                {"type": "text", "text": "Briefly describe what this robot camera sees, in English."},
+                {"type": "image_url", "image_url": {"url": url}}]}])
+        return (r.choices[0].message.content or "").strip() or "(nothing notable)"
+    except Exception as exc:
+        return f"(look failed: {exc})"
+
+
+_ACT_MAP = {"approach": "APPROACH", "find_me": "FINDME", "cuddle": "CUDDLE",
+            "dance": "DANCE", "wiggle": "WIGGLE", "raise_hand": "RAISEHAND",
+            "lower_hand": "LOWERHAND", "look_around": "LOOKAROUND", "stop": "STOP",
+            "return_to_charger": "CHARGE", "head_up": "HEADUP", "head_down": "HEADDOWN"}
+
+
+def _tool_sense(a):
+    return json.dumps(ROBOT.sense()) if ROBOT else "(no body)"
+
+
+def _tool_look(a):
+    if not ROBOT:
+        return "(no body)"
+    f = ROBOT.get_frame()
+    return _describe_scene(f) if f is not None else "(no image)"
+
+
+def _bg(fn):
+    threading.Thread(target=fn, daemon=True).start()
+
+
+def _tool_act(a):
+    if not ROBOT:
+        return "(no body)"
+    action = str(a.get("action", "")).lower()
+    amt = a.get("amount")
+    if action in ("drive_forward", "drive_back", "turn_left", "turn_right"):
+        base = {"drive_forward": "FRWD", "drive_back": "BACK",
+                "turn_left": "LEFT", "turn_right": "RIGHT"}[action]
+        token = f"{base}_{amt or (2 if 'drive' in action else 1)}"
+    else:
+        token = _ACT_MAP.get(action)
+    if not token:
+        return f"(unknown action {action})"
+    _bg(lambda: ROBOT.act(token))
+    return f"started: {action}"
+
+
+def _tool_set_eyes(a):
+    if not ROBOT:
+        return "(no body)"
+    _bg(lambda: ROBOT.eye_color(str(a.get("color", "calm"))))
+    return "ok"
+
+
+def _tool_emote(a):
+    if not ROBOT:
+        return "(no body)"
+    _bg(lambda: ROBOT.emote(str(a.get("emotion", "happy"))))
+    return "ok"
+
+
+def _tool_vector_intent(a):
+    if not ROBOT:
+        return "(no body)"
+    name = str(a.get("trigger", ""))
+    _bg(lambda: ROBOT.play_trigger(name))
+    return f"playing {name}"
+
+
+_TRICK_KW = ("fist", "wheelie", "dance", "celebrat", "pounce", "petting", "cube",
+             "fetch", "greet", "laugh", "happy", "comehere", "victory")
+_builtin = sorted(set(t for t in (ROBOT.triggers if ROBOT else [])
+                      if any(k in t.lower() for k in _TRICK_KW)))[:50]
+
+BODY_TOOLS = [
+    {"type": "function", "function": {
+        "name": "sense", "description": "Read your body sensors NOW (battery 0-3, "
+        "on_charger, being_held, picked_up, cliff_detected, proximity_mm, accel/tilt, "
+        "faces). Use to decide actions (e.g. low battery -> return_to_charger).",
+        "parameters": {"type": "object", "properties": {}}}},
+    {"type": "function", "function": {
+        "name": "look", "description": "Look through your camera; returns what you see.",
+        "parameters": {"type": "object", "properties": {}}}},
+    {"type": "function", "function": {
+        "name": "act", "description": "Do a physical action with your body (wheels, "
+        "hand, head). e.g. dance when you hear music or feel happy.",
+        "parameters": {"type": "object", "properties": {
+            "action": {"type": "string", "enum": list(_ACT_MAP.keys()) +
+                       ["drive_forward", "drive_back", "turn_left", "turn_right"]},
+            "amount": {"type": "number"}}, "required": ["action"]}}},
+    {"type": "function", "function": {
+        "name": "set_eyes", "description": "Set your eye colour.",
+        "parameters": {"type": "object", "properties": {
+            "color": {"type": "string",
+                      "enum": ["love", "happy", "calm", "curious", "angry", "neutral"]}},
+            "required": ["color"]}}},
+    {"type": "function", "function": {
+        "name": "emote", "description": "Play an emotion animation.",
+        "parameters": {"type": "object", "properties": {
+            "emotion": {"type": "string", "enum": ["happy", "veryHappy", "sad", "angry",
+                        "love", "celebrate", "thinking", "confused", "surprised"]}},
+            "required": ["emotion"]}}},
+]
+if _builtin:
+    BODY_TOOLS.append({"type": "function", "function": {
+        "name": "vector_intent",
+        "description": "Play one of Vector's built-in behaviours/animations (fist "
+                       "bump, wheelie, celebrate, etc.) by trigger name.",
+        "parameters": {"type": "object", "properties": {
+            "trigger": {"type": "string", "enum": _builtin}}, "required": ["trigger"]}}})
+
+ALL_TOOL_FNS = {
+    "memory_search": _tool_memory_search, "memory_get": _tool_memory_get,
+    "sense": _tool_sense, "look": _tool_look, "act": _tool_act,
+    "set_eyes": _tool_set_eyes, "emote": _tool_emote, "vector_intent": _tool_vector_intent,
+}
+_ALL_TOOLS = MEMORY_TOOLS + (BODY_TOOLS if ROBOT is not None else [])
+GPT.set_tools(_ALL_TOOLS, ALL_TOOL_FNS)
+
+# --- Harness: load the tool catalogue into the system prompt so the brain knows
+#     its full capabilities (openclaw/pi-agent style context engineering) -------
+def _tool_catalogue(tools) -> str:
+    lines = []
+    for t in tools:
+        fn = t["function"]
+        params = ", ".join(fn.get("parameters", {}).get("properties", {}).keys())
+        lines.append(f"- {fn['name']}({params}): {fn['description']}")
+    return "\n".join(lines)
+
+
+GPT.messages[0]["content"] += (
+    "\n\n---\n# Your tools (call them to sense, act, remember)\n"
+    + _tool_catalogue(_ALL_TOOLS)
+    + "\nJudge from your live body/sensor state and memory below; call tools when "
+    "you need fresh info or to act (e.g. low battery -> act(return_to_charger); "
+    "hear music / very happy -> act(dance)). Keep spoken words in your reply for "
+    "the user; tool calls are silent."
+)
+
+
+def build_context(user_text: str) -> str:
+    """Assemble the dynamic per-turn context (harness): live sensor state +
+    memory (long-term + today's journal) + QMD-recalled memories."""
+    parts = []
+    # Use the CACHED sensor snapshot (refreshed in the reflex loop) — no RPC on
+    # the voice request path, so wire-pod doesn't time out waiting.
+    snap = _STATE.get("sense")
+    if snap:
+        parts.append("# Your body & senses RIGHT NOW\n"
+                     + json.dumps(snap, ensure_ascii=False))
+    ctx = MEMORY.today_context()
+    if ctx:
+        parts.append("# Your memory\n" + ctx)
+    # Recall is an embedding call (~1s); skip it for very short/greeting turns.
+    if len((user_text or "").split()) >= 3:
+        recalled = MEMORY.recall(user_text)
+        if recalled:
+            parts.append("# Relevant memories (recall)\n" + recalled)
+    return "\n\n".join(parts)
+
+
+print(f"[brain] tools ON: memory + body sensors/actuators "
+      f"({len(_builtin)} built-in intents)")
+print(f"[brain] harness: live sensors + memory + tools injected into context")
 print(f"[brain] ready: model={GPT.model}")
 
 
@@ -135,7 +346,7 @@ def transcribe(wav_path: str) -> str:
 
 _TOKEN_RE = re.compile(r"@.*?@")
 _BRAIN_LOCK = threading.Lock()          # serialize GPT calls across threads
-_STATE = {"voice_active": 0.0, "button_ts": 0.0}
+_STATE = {"voice_active": 0.0, "button_ts": 0.0, "sense": {}}
 VISION_WORDS = ("thấy", "nhìn", "xem", "see", "look", "đọc", "màu", "ai ", "gì",
                 "what", "who", "camera", "trước mặt")
 
@@ -148,6 +359,28 @@ def clean_spoken(text: str) -> str:
 
 def parse_commands(text: str):
     return re.findall(r"@(.*?)@", text)
+
+
+class _TokenStripper:
+    """Incrementally strips @COMMAND@ tokens from a streaming reply so only spoken
+    words go out, holding back any partial '@...' until the token completes."""
+    def __init__(self):
+        self.buf = ""
+
+    def feed(self, text: str) -> str:
+        self.buf += text
+        self.buf = re.sub(r"@[^@]*@", "", self.buf)   # drop complete tokens
+        idx = self.buf.rfind("@")                      # hold back a dangling token start
+        if idx == -1:
+            out, self.buf = self.buf, ""
+        else:
+            out, self.buf = self.buf[:idx], self.buf[idx:]
+        return out
+
+    def flush(self) -> str:
+        out = re.sub(r"@[^@]*@", "", self.buf).replace("@", "")
+        self.buf = ""
+        return out
 
 
 MOVE_CMDS = ("APPROACH", "CUDDLE", "WIGGLE", "FRWD", "BACK", "LEFT", "RIGHT", "TURN", "DRIVE")
@@ -310,7 +543,7 @@ EVENT_COOLDOWN = float(os.environ.get("VECTOR_EVENT_COOLDOWN", "6"))
 
 def reflex_loop():
     prev_touch = prev_pick = prev_cliff = False
-    last_event = last_batt = batt_check = 0.0
+    last_event = last_batt = batt_check = last_snap = 0.0
     shake = 0
     while True:
         time.sleep(0.1)
@@ -324,6 +557,13 @@ def reflex_loop():
             continue
         if button:
             _STATE["button_ts"] = now
+        # Cache a full sensor snapshot (~3s) so the voice path needs no RPC.
+        if now - last_snap > 3:
+            last_snap = now
+            try:
+                _STATE["sense"] = ROBOT.sense()
+            except Exception:
+                pass
 
         # ---- SAFETY (instant, no LLM): table edge -> stop the wheels NOW ----
         if cliff and not prev_cliff:
@@ -448,51 +688,59 @@ class Handler(BaseHTTPRequestHandler):
         low = user.lower()
         if ROBOT is not None and any(w in low for w in VISION_WORDS):
             frame = ROBOT.get_frame()
-        # Context = always-on daily memory (long-term + today's notes) + QMD recall,
-        # on top of the live conversation thread already in GPT.messages.
-        ctx = MEMORY.today_context()
-        recalled = MEMORY.recall(user)
-        mems = (ctx + ("\n\n# Relevant memories\n" + recalled if recalled else "")).strip()
-        with _BRAIN_LOCK:
-            raw = GPT.get_answer(user, image=frame, memories=mems)
-        spoken = clean_spoken(raw) or "..."
-        print(f"[chat] vector: {spoken!r}  ({[c for c in parse_commands(raw)]})")
-
-        # Perform body actions in the background so the spoken reply isn't delayed.
-        threading.Thread(target=_deferred_act, args=(raw,), daemon=True).start()
-        # Remember the exchange + learn about new people, in the background.
-        threading.Thread(target=_post_chat, args=(user, spoken), daemon=True).start()
+        ctx = build_context(user)
 
         if stream:
-            self._stream(spoken)
+            self._stream_live(user, frame, ctx)        # fast first word
         else:
+            with _BRAIN_LOCK:
+                raw = GPT.get_answer(user, image=frame, memories=ctx, use_tools=False)
+            spoken = clean_spoken(raw) or "..."
+            print(f"[chat] vector: {spoken!r}  ({parse_commands(raw)})")
+            threading.Thread(target=_deferred_act, args=(raw,), daemon=True).start()
+            threading.Thread(target=_post_chat, args=(user, spoken), daemon=True).start()
             self._json(200, {"id": "chatcmpl-vb", "object": "chat.completion",
                              "created": int(time.time()), "model": GPT.model,
                              "choices": [{"index": 0, "finish_reason": "stop",
                                           "message": {"role": "assistant", "content": spoken}}]})
 
-    def _stream(self, text):
+    def _stream_live(self, user, frame, ctx):
+        """Stream the brain's reply token-by-token (wire-pod speaks as it arrives),
+        stripping @COMMAND@ tokens from the spoken text on the fly."""
+        base = {"id": "chatcmpl-vb", "object": "chat.completion.chunk",
+                "created": int(time.time()), "model": GPT.model}
+
+        def send(delta, finish=None):
+            ch = dict(base); ch["choices"] = [{"index": 0, "delta": delta, "finish_reason": finish}]
+            self.wfile.write(f"data: {json.dumps(ch)}\n\n".encode()); self.wfile.flush()
+
+        stripper = _TokenStripper()
         try:
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
             self.send_header("Cache-Control", "no-cache")
             self.end_headers()
-            base = {"id": "chatcmpl-vb", "object": "chat.completion.chunk",
-                    "created": int(time.time()), "model": GPT.model}
-
-            def send(delta, finish=None):
-                ch = dict(base); ch["choices"] = [{"index": 0, "delta": delta, "finish_reason": finish}]
-                self.wfile.write(f"data: {json.dumps(ch)}\n\n".encode()); self.wfile.flush()
-
             send({"role": "assistant"})
-            for w in text.split(" "):
-                send({"content": w + " "})
+            with _BRAIN_LOCK:
+                for delta in GPT.stream_answer(user, image=frame, memories=ctx):
+                    words = stripper.feed(delta)
+                    if words:
+                        send({"content": words})
+            tail = stripper.flush()
+            if tail:
+                send({"content": tail})
             send({}, "stop")
             self.wfile.write(b"data: [DONE]\n\n"); self.wfile.flush()
         except (BrokenPipeError, ConnectionError):
             pass
         except Exception as exc:
             print(f"[chat] stream err: {exc}")
+        full = getattr(GPT, "last_full", "") or ""
+        if full:
+            print(f"[chat] vector: {clean_spoken(full)!r}  ({parse_commands(full)})")
+            _STATE["voice_active"] = time.time()
+            threading.Thread(target=_deferred_act, args=(full,), daemon=True).start()
+            threading.Thread(target=_post_chat, args=(user, clean_spoken(full)), daemon=True).start()
 
 
 def _deferred_act(raw):
@@ -570,35 +818,45 @@ def _post_chat(user: str, spoken: str) -> None:
         print(f"[memory] post_chat failed: {exc}")
 
 
-def consolidate_loop():
-    """Runs 24/7. On each new day, Vector Brain consolidates the finished day's
-    journal into long-term MEMORY.md and starts a fresh daily chat thread."""
+DREAM_HOURS = float(os.environ.get("VECTOR_DREAM_HOURS", "12"))
+
+
+def dream_loop():
+    """Runs 24/7. Periodically (and on each new day) Vector Brain DREAMS: reflects
+    (DREAMS.md), consolidates durable memory (MEMORY.md) and refreshes the
+    knowledge wiki. On a new day it also starts a fresh daily chat thread."""
     current_day = time.strftime("%d-%m-%Y")
+    last_dream = time.time()
     while True:
-        time.sleep(1800)   # check for day rollover every 30 min
+        time.sleep(1800)   # check every 30 min
+        now = time.time()
         day = time.strftime("%d-%m-%Y")
-        if day == current_day:
+        new_day = day != current_day
+        due = now - last_dream > DREAM_HOURS * 3600
+        if not (new_day or due):
             continue
-        current_day = day
-        try:
-            if MEMORY.consolidate():
-                print("[memory] new day -> consolidated journals into MEMORY.md")
-        except Exception as exc:
-            print(f"[memory] consolidate: {exc}")
-        # Fresh daily chat thread; continuity now comes from long-term + journal.
-        try:
-            with _BRAIN_LOCK:
-                GPT.messages = [GPT.messages[0]]
-            print("[brain] new day -> fresh chat thread")
-        except Exception:
-            pass
+        if not busy():            # only dream when the human isn't interacting
+            try:
+                if MEMORY.dream():
+                    last_dream = now
+                    print("[memory] dreaming sweep -> DREAMS.md / MEMORY.md / wiki")
+            except Exception as exc:
+                print(f"[memory] dream: {exc}")
+        if new_day:
+            current_day = day
+            try:
+                with _BRAIN_LOCK:
+                    GPT.messages = [GPT.messages[0]]
+                print("[brain] new day -> fresh chat thread")
+            except Exception:
+                pass
 
 
 def main():
     if ROBOT is not None and AUTONOMOUS:
         threading.Thread(target=autonomous_loop, daemon=True).start()
         print(f"[brain] autonomous loop ON (every {AGENT_INTERVAL:.0f}s, model={AUTO_MODEL})")
-    threading.Thread(target=consolidate_loop, daemon=True).start()
+    threading.Thread(target=dream_loop, daemon=True).start()
     if ROBOT is not None and TOUCH_ENABLED:
         threading.Thread(target=reflex_loop, daemon=True).start()
         print("[brain] reflex loop ON (cliff-safety, pickup/shake/flip/touch/battery)")
