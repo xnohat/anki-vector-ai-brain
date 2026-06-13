@@ -42,7 +42,10 @@ SPEAK_LANG = os.environ.get("VECTOR_LANG", "Vietnamese")
 STT_BACKEND = os.environ.get("VECTOR_STT_BACKEND", "openai").lower()
 STT_API_MODEL = os.environ.get("VECTOR_STT_API_MODEL", "gpt-4o-mini-transcribe")
 STT_API_LANG = os.environ.get("VECTOR_STT_LANG", "vi")
-AGENT_INTERVAL = float(os.environ.get("VECTOR_AGENT_INTERVAL", "150"))
+AGENT_INTERVAL = float(os.environ.get("VECTOR_AGENT_INTERVAL", "15"))
+# Cheap model for the constant autonomous/reflex ticks (runs all day) — keep it
+# small + stateless so token cost stays tiny. gpt-5.5 is only for voice chats.
+AUTO_MODEL = os.environ.get("VECTOR_AUTO_MODEL", "gpt-4o-mini")
 TOUCH_COOLDOWN = float(os.environ.get("VECTOR_TOUCH_COOLDOWN", "8"))
 VOICE_BACKOFF = float(os.environ.get("VECTOR_VOICE_BACKOFF", "10"))
 AUTONOMOUS = os.environ.get("VECTOR_AUTONOMOUS", "1") not in ("0", "false", "False", "")
@@ -116,7 +119,7 @@ def transcribe(wav_path: str) -> str:
 
 _TOKEN_RE = re.compile(r"@.*?@")
 _BRAIN_LOCK = threading.Lock()          # serialize GPT calls across threads
-_STATE = {"voice_active": 0.0}
+_STATE = {"voice_active": 0.0, "button_ts": 0.0}
 VISION_WORDS = ("thấy", "nhìn", "xem", "see", "look", "đọc", "màu", "ai ", "gì",
                 "what", "who", "camera", "trước mặt")
 
@@ -131,13 +134,19 @@ def parse_commands(text: str):
     return re.findall(r"@(.*?)@", text)
 
 
-def act_async(reply: str, speak_via_sdk: bool, frame_provider=None):
-    """Perform the body actions in `reply`; optionally speak it via the SDK."""
+MOVE_CMDS = ("APPROACH", "CUDDLE", "WIGGLE", "FRWD", "BACK", "LEFT", "RIGHT", "TURN", "DRIVE")
+
+
+def act_async(reply: str, speak_via_sdk: bool, frame_provider=None, allow_move=True):
+    """Perform the body actions in `reply`; optionally speak it via the SDK.
+    allow_move=False skips wheel/approach actions (e.g. when picked up or flipped)."""
     commands = parse_commands(reply)
     spoken = clean_spoken(reply)
     silent = any(c.strip().upper() == "SILENT" for c in commands)
     if ROBOT is None:
         return spoken  # voice-only: no body, no SDK speech (wire-pod speaks)
+    if not allow_move:
+        commands = [c for c in commands if not c.strip().upper().startswith(MOVE_CMDS)]
 
     # LLM asked to see -> grab a frame and re-ask once.
     if frame_provider and any(c.strip().upper() == "LOOK" for c in commands):
@@ -162,48 +171,71 @@ def act_async(reply: str, speak_via_sdk: bool, frame_provider=None):
     return spoken
 
 
-def sensors_summary(s: dict) -> str:
-    parts = []
-    for k, v in s.items():
-        parts.append(f"{k}={v}")
-    return ", ".join(parts)
+# Concise action vocab for cheap, low-token autonomous/reflex prompts.
+SHORT_ACTIONS = (
+    "Put action tokens inline; the app runs them. @APPROACH@ roll to human, "
+    "@CUDDLE@ happy wag, @RAISEHAND@, @LOOKAROUND@, @WIGGLE@, @TURN_90@, "
+    "@EMOTE_X@ (happy/sad/love/angry/celebrate/confused/surprised), "
+    "@EYE_X@ (love/happy/calm/curious/angry), @SILENT@ = do nothing."
+)
+LIGHT_SYS = (
+    f"You are Vector, a tiny {SPEAK_LANG}-speaking robot pet: cute, witty, loving. "
+    f"Reply in {SPEAK_LANG}, MAX 12 words, or exactly @SILENT@. " + SHORT_ACTIONS
+)
+
+
+def light_reply(situation: str, max_tokens: int = 60) -> str:
+    """One cheap, STATELESS tick on the small model (low token cost, all-day)."""
+    try:
+        r = GPT.client.chat.completions.create(
+            model=AUTO_MODEL,
+            messages=[{"role": "system", "content": LIGHT_SYS},
+                      {"role": "user", "content": situation}],
+            max_tokens=max_tokens, temperature=1.0)
+        return (r.choices[0].message.content or "@SILENT@").strip()
+    except Exception as exc:
+        print(f"[auto] light_reply failed: {exc}")
+        return "@SILENT@"
+
+
+def react(situation: str, speak: bool = True, allow_move: bool = True) -> None:
+    """Cheap LLM reaction to a sensor event, then act."""
+    said = act_async(light_reply(situation), speak_via_sdk=speak, allow_move=allow_move)
+    if said:
+        print(f"[react] {said}")
+
+
+def busy() -> bool:
+    """True if the human is talking / listening / touching — don't auto-interrupt."""
+    now = time.time()
+    if now - _STATE["voice_active"] < VOICE_BACKOFF:
+        return True
+    if now - _STATE.get("button_ts", 0) < 8:
+        return True
+    try:
+        t, h, b = ROBOT.feel()
+        return bool(t or h or b)
+    except Exception:
+        return False
 
 
 # --------------------------------------------------------------------------- #
-# Autonomous agent loop — read all sensors, let the LLM be a smart pet.
+# Autonomous loop — cheap model, every ~15s, mostly silent, never interrupts.
 # --------------------------------------------------------------------------- #
-def agent_loop():
+def autonomous_loop():
     while True:
         time.sleep(AGENT_INTERVAL)
-        if not AUTONOMOUS:
-            continue
-        if time.time() - _STATE["voice_active"] < VOICE_BACKOFF:
-            continue
-        # Don't grab control while the human is interacting (button/touch/held).
-        t, h, b = ROBOT.feel()
-        if t or h or b:
+        if not AUTONOMOUS or busy():
             continue
         try:
-            s = ROBOT.sense()
-            prompt = (
-                "[AUTONOMOUS] No one is talking to you. Your senses right now: "
-                + sensors_summary(s) + ". "
-                "You are a calm robot pet resting. MOST of the time reply with EXACTLY "
-                "@SILENT@ and nothing else (stay quiet, don't move). Only rarely (about "
-                "1 in 4 beats) do ONE small delightful thing — a quiet look around, a "
-                "gentle eye-colour change, or if a face is visible roll a little closer "
-                "and say one short sweet line. Never be noisy or repetitive. If "
-                "held/picked up/cliff/on charger, do NOT move — @SILENT@ or a soft word."
-            )
-            with _BRAIN_LOCK:
-                reply = GPT.get_answer(prompt)
-            # collapse the long instruction in history
-            try:
-                if GPT.messages[-2]["role"] == "user":
-                    GPT.messages[-2]["content"] = "[autonomous sense]"
-            except Exception:
-                pass
-            said = act_async(reply, speak_via_sdk=True, frame_provider=ROBOT.get_frame)
+            faces = ROBOT.sense().get("faces_visible", 0)
+            _, charging, on_charger = ROBOT.battery()
+            sit = (f"You are resting. on_charger={on_charger}, face_seen={faces > 0}. "
+                   "Usually reply @SILENT@. About 1 in 5 times do ONE tiny delightful "
+                   "thing: look around, a gentle eye colour, or (only if a face is seen "
+                   "and NOT on charger) roll a bit closer + one short sweet line.")
+            reply = light_reply(sit)
+            said = act_async(reply, speak_via_sdk=True, allow_move=(faces > 0 and not on_charger))
             if said:
                 print(f"[auto] {said}")
         except Exception as exc:
@@ -211,54 +243,78 @@ def agent_loop():
 
 
 # --------------------------------------------------------------------------- #
-# Touch loop — backpack petting / being picked up -> cuddle + affection.
+# Reflex loop — fast sensor reflexes (safety) + event reactions.
 # --------------------------------------------------------------------------- #
-def touch_loop():
-    prev_touch = prev_held = False
-    last = 0.0
-    last_button = 0.0
+SHAKE_GYRO = float(os.environ.get("VECTOR_SHAKE_GYRO", "8"))
+# Upright accel.z ~ +9400. Tilted >~70deg or upside-down -> z drops below this.
+FLIP_AZ = float(os.environ.get("VECTOR_FLIP_AZ", "3500"))
+EVENT_COOLDOWN = float(os.environ.get("VECTOR_EVENT_COOLDOWN", "6"))
+
+
+def reflex_loop():
+    prev_touch = prev_pick = prev_cliff = False
+    last_event = last_batt = batt_check = 0.0
+    shake = 0
     while True:
-        time.sleep(0.05)   # poll fast so we catch the brief button click
-        touched, held, button = ROBOT.feel()
+        time.sleep(0.1)
         now = time.time()
-        if button:
-            last_button = now
-        # Pressing the button also registers as a backpack touch. Suppress touch
-        # reactions for a few seconds around any button press so it can't hijack
-        # the "listen to me" flow with a cuddle.
-        if now - last_button < 6.0:
-            prev_touch, prev_held = touched, held
-            continue
-        event = None
-        if touched and not prev_touch:
-            event = "Người chủ đang vuốt ve lưng (backpack) của bạn."
-        elif held and not prev_held:
-            event = "Người chủ vừa bế bạn lên tay."
-        prev_touch, prev_held = touched, held
-        if not event:
-            continue
-        now = time.time()
-        if now - last < TOUCH_COOLDOWN or now - _STATE["voice_active"] < VOICE_BACKOFF:
-            continue
-        last = now
         try:
-            # snappy cuddle first, then an affectionate spoken line
-            if touched:
-                ROBOT.act("CUDDLE")
-            with _BRAIN_LOCK:
-                reply = GPT.get_answer(
-                    f"[SENSOR] {event} React like a happy pet: a short loving line "
-                    "in Vietnamese + a fitting action. If not held you may @CUDDLE@ "
-                    "or @WIGGLE@ or @EMOTE_love@.")
+            touched, held, button = ROBOT.feel()
+            picked = ROBOT.picked_up()
+            cliff = ROBOT.cliff()
+            az, gmag, pitch = ROBOT.motion()
+        except Exception:
+            continue
+        if button:
+            _STATE["button_ts"] = now
+
+        # ---- SAFETY (instant, no LLM): table edge -> stop the wheels NOW ----
+        if cliff and not prev_cliff:
+            ROBOT.stop()
+            print("[reflex] CLIFF! wheels stopped")
+        prev_cliff = cliff
+
+        shake = min(6, shake + 1) if gmag > SHAKE_GYRO else max(0, shake - 1)
+        suppress = busy() or (now - _STATE.get("button_ts", 0) < 6)
+
+        event = None
+        allow_move = True
+        if not suppress and now - last_event > EVENT_COOLDOWN:
+            if picked and not prev_pick:
+                event, allow_move = "Người chủ vừa nhấc bạn lên khỏi mặt đất.", False
+            elif prev_pick and not picked:
+                event = "Bạn vừa được đặt xuống mặt phẳng."
+            elif az < FLIP_AZ and not picked:
+                event, allow_move = "Bạn vừa bị lật nghiêng hoặc úp ngược.", False
+            elif shake >= 3:
+                event, allow_move = "Ai đó đang lắc người bạn.", False
+            elif touched and not prev_touch:
+                event = "Người chủ đang vuốt ve lưng bạn."
+        prev_touch, prev_pick = touched, picked
+
+        if event:
+            last_event = now
+            shake = 0
             try:
-                if GPT.messages[-2]["role"] == "user":
-                    GPT.messages[-2]["content"] = "[touched]"
-            except Exception:
-                pass
-            said = act_async(reply, speak_via_sdk=True)
-            print(f"[touch] {said}")
-        except Exception as exc:
-            print(f"[touch] failed: {exc}")
+                if "vuốt" in event:
+                    ROBOT.act("CUDDLE")
+                react(event, allow_move=allow_move)
+            except Exception as exc:
+                print(f"[reflex] {exc}")
+            continue
+
+        # ---- battery low -> yell for help + crawl back to the charger ----
+        if now - batt_check > 8:
+            batt_check = now
+            level, charging, on_charger = ROBOT.battery()
+            if (level is not None and level <= 1 and not charging and not on_charger
+                    and not suppress and now - last_batt > 120):
+                last_batt = now
+                try:
+                    react("Pin sắp cạn! Kêu cứu thật đáng yêu bằng tiếng Việt.")
+                    ROBOT.return_to_charger()
+                except Exception as exc:
+                    print(f"[reflex] battery: {exc}")
 
 
 # --------------------------------------------------------------------------- #
@@ -286,6 +342,8 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path.rstrip("/") in ("/health", "/healthz"):
             self._json(200, {"ok": True, "model": GPT.model})
+        elif self.path.rstrip("/") == "/sense":
+            self._json(200, ROBOT.sense() if ROBOT is not None else {"body": "disabled"})
         else:
             self._json(404, {"error": "not found"})
 
@@ -387,11 +445,11 @@ def _deferred_act(raw):
 
 def main():
     if ROBOT is not None and AUTONOMOUS:
-        threading.Thread(target=agent_loop, daemon=True).start()
-        print(f"[brain] autonomous pet loop ON (every {AGENT_INTERVAL:.0f}s)")
+        threading.Thread(target=autonomous_loop, daemon=True).start()
+        print(f"[brain] autonomous loop ON (every {AGENT_INTERVAL:.0f}s, model={AUTO_MODEL})")
     if ROBOT is not None and TOUCH_ENABLED:
-        threading.Thread(target=touch_loop, daemon=True).start()
-        print("[brain] touch/backpack reactions ON (button press ignored = listen)")
+        threading.Thread(target=reflex_loop, daemon=True).start()
+        print("[brain] reflex loop ON (cliff-safety, pickup/shake/flip/touch/battery)")
     server = ThreadingHTTPServer((HOST, PORT), Handler)
     print(f"[brain] listening on http://{HOST}:{PORT}  (/stt, /v1)")
     try:

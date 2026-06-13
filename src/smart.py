@@ -170,8 +170,70 @@ class SmartVector:
                 s['face_names'] = names
         except Exception:
             pass
+        try:
+            a = r.accel
+            s['accel'] = [round(a.x), round(a.y), round(a.z)]
+            s['pitch_deg'] = round(r.pose_pitch_rad * 57.3)
+        except Exception:
+            pass
         s['time'] = time.strftime('%H:%M')
         return s
+
+    def motion(self) -> tuple:
+        """Cheap RPC-free (accel_z, gyro_magnitude, pitch_deg) for shake/flip."""
+        az = 0.0
+        gmag = 0.0
+        pitch = 0.0
+        try:
+            a = self.robot.accel
+            az = float(a.z)
+        except Exception:
+            pass
+        try:
+            g = self.robot.gyro
+            gmag = (g.x ** 2 + g.y ** 2 + g.z ** 2) ** 0.5
+        except Exception:
+            pass
+        try:
+            pitch = self.robot.pose_pitch_rad * 57.3
+        except Exception:
+            pass
+        return az, gmag, pitch
+
+    def cliff(self) -> bool:
+        try:
+            return bool(self.robot.status.is_cliff_detected)
+        except Exception:
+            return False
+
+    def picked_up(self) -> bool:
+        try:
+            return bool(self.robot.status.is_picked_up)
+        except Exception:
+            return False
+
+    def battery(self) -> tuple:
+        """(level 0-3, is_charging, is_on_charger). RPC — call sparingly."""
+        try:
+            bs = _wait(self.robot.get_battery_state())
+            if bs:
+                return bs.battery_level, bool(bs.is_charging), bool(bs.is_on_charger)
+        except Exception:
+            pass
+        return None, None, None
+
+    def stop(self) -> None:
+        try:
+            self.robot.motors.stop_all_motors()
+        except Exception:
+            pass
+
+    def return_to_charger(self) -> None:
+        with self.control():
+            try:
+                _wait(self.robot.behavior.drive_on_charger())
+            except Exception:
+                pass
 
     # -------------------------------------------------------------- actions
     def emote(self, name: str) -> None:
@@ -192,12 +254,27 @@ class SmartVector:
         except Exception:
             pass
 
+    def _drive_safe(self, left: int, right: int, dur: float) -> bool:
+        """Drive with raw motors but STOP + back off if a table edge (cliff) is
+        seen. Returns True if an edge was hit. Raw motors bypass firmware cliff
+        protection, so we must guard it ourselves."""
+        self.robot.motors.set_wheel_motors(left, right)
+        steps = max(1, int(min(dur, 6.0) / 0.08))
+        for _ in range(steps):
+            time.sleep(0.08)
+            if self.cliff():
+                self.robot.motors.set_wheel_motors(0, 0)
+                self.robot.motors.set_wheel_motors(-80, -80)  # back away from edge
+                time.sleep(0.5)
+                self.robot.motors.set_wheel_motors(0, 0)
+                return True
+        self.robot.motors.set_wheel_motors(0, 0)
+        return False
+
     def drive(self, left: int, right: int, dur: float) -> None:
         with self.control():
             self._off_charger()
-            self.robot.motors.set_wheel_motors(left, right)
-            time.sleep(max(0.1, min(dur, 6.0)))
-            self.robot.motors.set_wheel_motors(0, 0)
+            self._drive_safe(left, right, max(0.1, min(dur, 6.0)))
 
     def turn(self, deg: float) -> None:
         with self.control():
