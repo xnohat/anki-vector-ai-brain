@@ -1,111 +1,76 @@
-# vector-advanced-ai
+# Vector Brain — an AI Agent with a physical body
 
-> A smart Anki Vector **robot pet** with a gpt-5.5 brain — it listens with its own
-> mic, talks and thinks in Vietnamese, sees, feels touch, senses its world, and
-> acts with its body. One brain, one body, one process.
+> An Anki **Vector** robot turned into a real AI Agent: one **gpt-5.5** brain with
+> a body (camera, mic, speaker, hand, wheels), live senses, reflexes, tools, and
+> persistent memory. It listens through Vector's own mic, thinks and speaks in
+> Vietnamese, sees, feels, remembers people, and acts — all in one process.
 
 ![vector](resources/vector.jpg)
 
-## What it does
-- **Listens** through Vector's *real* microphone ("Hey Vector, …") via wire-pod.
-- **Thinks** with one gpt-5.5 brain (Vietnamese, sassy-but-loving pet personality).
-- **Acts** with its body: come near you (`@APPROACH@` — turns to your face, rolls
-  closer), cuddle like a happy dog (hand + wheels), raise its hand, look around,
-  drive/turn, change eye colour, emote.
-- **Feels** the backpack touch and being picked up → cuddles and reacts.
-- **Senses** everything (battery, proximity, cliff, faces, held/picked-up, …) and
-  an **autonomous agent loop** lets the LLM judge it and do delightful unexpected
-  things — roll over and say *"Em nhớ anh quá"*, raise a hand, look around.
-- **Sees** through its camera when you ask.
+## What it is
 
-## How it works
+The **Brain** (`brain_server.py`) is the agent's mind; **Vector** is its body.
+
+- **Listen** — Vector's *real* microphone (press the backpack button or "Hey
+  Vector") → wire-pod → our fast cloud STT.
+- **Think** — one gpt-5.5 brain (Vietnamese, a curious sassy-but-loving pet).
+- **Speak** — Vietnamese, streamed token-by-token so the first word comes fast.
+- **See** — its camera (describe / read / recognize & photograph people).
+- **Act** — approach you, cuddle (hand + wheels), find-and-face you, dance, raise
+  a hand, drive/turn, eye colour, emote, and 50 built-in Vector animations.
+- **Reflexes** — feels pickup / shake / flip / petting, **stops at a table edge**,
+  and when the battery is low it yells for help and crawls back to the charger.
+- **Be autonomous** — a cheap loop every 15s lets it judge its world and do
+  delightful unexpected things; it's curious and journals what it learns.
+- **Remember (AI Agent)** — identity, people (`USER-*` + photo), a daily journal,
+  a daily chat thread for context, consolidated long-term memory, a knowledge
+  wiki, and **QMD** (embedding) recall feeding the brain. It even "dreams":
+  nightly it reflects, consolidates and refreshes its knowledge.
+- **Tools** — the agent calls tools to sense and act: `memory_search`,
+  `memory_get`, `sense`, `look`, `act`, `set_eyes`, `emote`, `vector_intent`.
+
+## Architecture
 
 ```
- Mic ──▶ Whisper STT ──▶ ┌──────────────────────────────┐ ──▶ TTS (Vector voice)
-                         │   GPT brain (gpt-5.5, vision)  │
- Camera frame ─────────▶ │   src/customgpt.py            │ ──▶ @COMMAND@ intents
-                         └──────────────────────────────┘      (move / emote / detect)
+ "Hey Vector / button" ─▶ Vector mic ─▶ wire-pod (VAD)
+                                          │  POST /stt  (fast cloud STT)
+                                          │  POST /v1   (gpt-5.5, streaming)
+                                          ▼
+                                   brain_server.py  ── SDK ──▶  Vector body
+                                   (harness: identity + tools +      (move, hand,
+                                    live sensors + memory + chat)      wheels, eyes)
+                                          │
+                                   memory/  (IDENTITY, USER-*, journal,
+                                             chat thread, MEMORY.md, wiki, DREAMS)
 ```
 
-- **Listen** — `src/speechstream.py` records mic audio and transcribes it locally with Whisper.
-- **Think** — `src/customgpt.py` sends the transcript (and, when asked, a live camera frame) to a vision-capable OpenAI model.
-- **See** — when you say things like *"what do you see"*, *"look"*, *"read this"*, *"what colour is this"*, the app grabs a frame from Vector's camera and the model describes/reads/reasons about it in real time.
-- **Act** — the model embeds `@COMMAND@` intent tokens in its reply; `app.py` strips them out and drives Vector (movement, lift, head, emotes, object detection) via the SDK.
-
-### Behaviour
-
-- **Wake word** — Vector ignores you until you say **"Vector"** (Vietnamese pronunciations like *véc tơ / vích to* are matched too). Whisper runs locally so listening is free; only wake-word turns hit the paid API. After replying he stays active for a few seconds so follow-ups need no wake word.
-- **Autonomous agent loop** — every ~90s Vector senses his situation (battery, charger, time, idle) and the LLM decides what to do: glance around with his camera (`@LOOK@`), make a short remark, emote, or stay quiet (`@SILENT@`). It never interrupts an active conversation.
-- **Vietnamese voice** — Vector thinks and replies in Vietnamese, spoken through his own speaker via OpenAI TTS (his onboard English voice can't pronounce Vietnamese). Configurable in `.env`.
-- **No microphone?** — just type to Vector in the UI box; everything else (brain, voice, vision, actions) works the same.
-
-> See `PRD.md` and `IMPLEMENTATION_PLAN.md` for the full design, research notes, and hardware verification.
-
-### Configure the brain
-
-Copy `.env.example` to `.env` and set your key:
-
-```sh
-cp .env.example .env
-# then edit .env:
-#   OPENAI_API_KEY=sk-...
-#   VECTOR_GPT_MODEL=gpt-5.5   # any vision-capable model; e.g. gpt-4.1 / gpt-4o if 5.5 isn't enabled
-```
-
-`run.sh` auto-loads `.env`. The model is swappable with one line — no code change.
+wire-pod is just the ears+mouth bridge; the Brain does everything else. See
+`BRIDGE_SETUP.md`, `PRD.md`, `IMPLEMENTATION_PLAN.md` for the full design.
 
 ## Setup
 
-### wire-pod
-
-Anki Servers are down. You need to first setup a local server using [wire-pod](https://github.com/kercre123/wire-pod).
-
-### vector-sdk
-
-Setup the sdk using my [fork](https://github.com/kingardor/vector-python-sdk).
-
-### Object Detection (Raspberry Pi Compatible)
-
-The project now uses **Hugging Face Transformers** with OWL-ViT for zero-shot object detection, optimized for Raspberry Pi CPU execution.
-
-Install dependencies:
-```sh
-pip install -r requirements.txt
-```
-
-### Installation Steps
-
-1. Install system dependencies (Debian/Ubuntu):
-```sh
-sudo apt-get update
-sudo apt-get install -y python3-pip python3-dev libjpeg-dev zlib1g-dev
-```
-
-2. Install Python packages:
-```sh
-pip install -r requirements.txt
-pip install -e vector-python-sdk/
-```
+1. **wire-pod** — a local Vector server: <https://github.com/kercre123/wire-pod>
+   (pair Vector, set your OpenAI key in its web UI).
+2. **Python deps**
+   ```sh
+   python3 -m venv .venv && . .venv/bin/activate
+   pip install -r requirements.txt
+   pip install -e vector-python-sdk/
+   ```
+3. **Config** — `cp .env.example .env` and set `OPENAI_API_KEY`. Everything else
+   (model, language, voice, intervals) has sensible defaults in `.env`.
 
 ## Run
 
-Start everything (brain server + Vector's-mic voice bridge via wire-pod):
-
 ```sh
-./run.sh
+./run.sh             # installs the wire-pod bridge, starts the brain + bridge
+./run.sh --no-pod    # brain server only (for testing /stt and /v1)
 ```
 
-Then say **"Hey Vector, …(tiếng Việt)"**. Other modes:
+Then press the backpack button and **speak Vietnamese**. The agent runs 24/7.
 
-```sh
-./run.sh --no-pod   # brain server only (e.g. to test /stt and /v1)
-./run.sh --sdk      # legacy standalone SDK app (app.py: text/USB-mic, agent loop, touch)
-```
+## Open source
 
-See `BRIDGE_SETUP.md` for the full architecture.
-
-### Performance Notes
-
-- First run will download the OWL-ViT model (~500MB)
-- Detection speed on Raspberry Pi 4: ~2-5 seconds per frame
-- For faster inference, consider using smaller images or the `google/owlvit-base-patch16` model
+All code, files and memory markers are in **English** so contributors can join
+(Vector still *speaks* Vietnamese). Personal memory (journals, people, photos,
+chat threads, embedding index) is gitignored — only the `IDENTITY.md` seed ships.

@@ -1,5 +1,6 @@
 import os
-import whisper
+# `whisper` (openai-whisper, needs torch) is only used for OFFLINE STT. The
+# default is fast cloud STT, so we import it lazily to keep torch optional.
 
 # Language for speech-to-text. Default Vietnamese (the user speaks Vietnamese).
 # Override with VECTOR_STT_LANG (e.g. "en", "vi"). Empty => Whisper auto-detect.
@@ -13,12 +14,15 @@ class WhisperSTT:
         self.language = (language if language is not None else STT_LANG) or None
         self.translate = translate
         model_size = model_size or STT_MODEL
+        import whisper
+        self._whisper = whisper
         print(f"\033[96mLoading Whisper '{model_size}' (lang={self.language or 'auto'})..\033[0m",
               end='', flush=True)
         self.model = whisper.load_model(model_size)
         print("\033[90m Done.\033[0m")
 
     def inference(self, path: str = 'dictate.wav') -> str:
+        whisper = self._whisper
         audio = whisper.load_audio(path)
         audio = whisper.pad_or_trim(audio)
 
