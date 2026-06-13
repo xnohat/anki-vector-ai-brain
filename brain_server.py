@@ -46,6 +46,9 @@ AGENT_INTERVAL = float(os.environ.get("VECTOR_AGENT_INTERVAL", "15"))
 # Cheap model for the constant autonomous/reflex ticks (runs all day) — keep it
 # small + stateless so token cost stays tiny. gpt-5.5 is only for voice chats.
 AUTO_MODEL = os.environ.get("VECTOR_AUTO_MODEL", "gpt-4o-mini")
+# Richer model for sensor REACTIONS (pickup/flip/shake/petting) so they're lively
+# and surprising — not the bare cheap autonomous ticks.
+REACT_MODEL = os.environ.get("VECTOR_REACT_MODEL", "gpt-4o")
 TOUCH_COOLDOWN = float(os.environ.get("VECTOR_TOUCH_COOLDOWN", "8"))
 VOICE_BACKOFF = float(os.environ.get("VECTOR_VOICE_BACKOFF", "10"))
 AUTONOMOUS = os.environ.get("VECTOR_AUTONOMOUS", "1") not in ("0", "false", "False", "")
@@ -422,11 +425,12 @@ def act_async(reply: str, speak_via_sdk: bool, frame_provider=None, allow_move=T
 
 # Concise action vocab for cheap, low-token autonomous/reflex prompts.
 SHORT_ACTIONS = (
-    "Put action tokens inline; the app runs them. @APPROACH@ roll to human, "
-    "@FINDME@ turn to find/face the caller, "
-    "@CUDDLE@ happy wag, @RAISEHAND@, @LOOKAROUND@, @WIGGLE@, @TURN_90@, "
-    "@EMOTE_X@ (happy/sad/love/angry/celebrate/confused/surprised), "
-    "@EYE_X@ (love/happy/calm/curious/angry), @SILENT@ = do nothing."
+    "Add inline action tokens (the app runs them and strips them from speech). "
+    "Movement: @APPROACH@ @FINDME@ @CUDDLE@ @WIGGLE@ @DANCE@ @RAISEHAND@ @LOOKAROUND@. "
+    "Emotion, pick ONE: @EMOTE_happy@ @EMOTE_love@ @EMOTE_surprised@ @EMOTE_celebrate@ "
+    "@EMOTE_angry@ @EMOTE_sad@ @EMOTE_confused@. "
+    "Eyes, pick ONE: @EYE_love@ @EYE_happy@ @EYE_curious@ @EYE_calm@ @EYE_angry@. "
+    "@SILENT@ = do nothing. Use ONLY these exact tokens, never invent others."
 )
 LIGHT_SYS = (
     f"You are Vector, a tiny {SPEAK_LANG}-speaking robot pet: cute, witty, loving. "
@@ -448,11 +452,43 @@ def light_reply(situation: str, max_tokens: int = 60) -> str:
         return "@SILENT@"
 
 
+# Rich, in-character reaction prompt (built once from Vector's identity).
+_REACT_SYS = None
+
+
+def _react_sys() -> str:
+    global _REACT_SYS
+    if _REACT_SYS is None:
+        _REACT_SYS = (
+            MEMORY.identity() + "\n\n"
+            "Something just physically happened to you. React like a real, surprised, "
+            f"emotional little pet — ONE vivid line in {SPEAK_LANG}, full of personality "
+            "(playful, dramatic, sassy, loving — your Ultron-pet wit). Be SPECIFIC to "
+            "what happened and SURPRISING: exclaim, tease, be ticklish, dizzy, delighted "
+            "or indignant. NEVER generic, NEVER just 'thank you' or 'save me', and never "
+            "repeat yourself. Address your human by name if you know it. Always include a "
+            "fitting @EMOTE_@ and @EYE_@, and a body action when it fits.\n" + SHORT_ACTIONS
+        )
+    return _REACT_SYS
+
+
 def react(situation: str, speak: bool = True, allow_move: bool = True) -> None:
-    """Cheap LLM reaction to a sensor event, then act."""
-    said = act_async(light_reply(situation), speak_via_sdk=speak, allow_move=allow_move)
-    if said:
-        print(f"[react] {said}")
+    """Rich, in-character reaction to a sensor event (knows you + your memory)."""
+    try:
+        mem = MEMORY.recall(situation + " my owner human", k=3)
+        usr = situation + (f"\n\n(What you remember:\n{mem})" if mem else "")
+        r = GPT.client.chat.completions.create(
+            model=REACT_MODEL, max_tokens=90, temperature=1.1,
+            messages=[{"role": "system", "content": _react_sys()},
+                      {"role": "user", "content": usr}])
+        reply = (r.choices[0].message.content or "").strip()
+    except Exception as exc:
+        print(f"[react] failed: {exc}")
+        return
+    if reply:
+        said = act_async(reply, speak_via_sdk=speak, allow_move=allow_move)
+        if said:
+            print(f"[react] {said}")
 
 
 def busy() -> bool:
@@ -582,17 +618,21 @@ def reflex_loop():
         event = None
         allow_move = True
         is_petting = False
-        if not suppress and now - last_event > EVENT_COOLDOWN:
-            if flipped and not prev_flipped:           # works held or not; check first
-                event, allow_move = "You were just tilted or flipped over!", False
-            elif picked and not prev_pick:
-                event, allow_move = "Someone just picked you up off the ground.", False
-            elif prev_pick and not picked:
-                event = "You were just put back down on a surface."
-            elif shake >= 3:
-                event, allow_move = "Someone is shaking you.", False
-            elif touched and not prev_touch:
+        if not suppress:
+            # Petting FIRST: pressing the backpack also tilts him (looks like a
+            # flip), so touch wins. Level-based (not edge) so continuous petting
+            # keeps reacting and a missed rising-edge during cooldown isn't lost.
+            if touched and now - last_event > TOUCH_COOLDOWN:
                 event, is_petting = "Your owner is petting your back.", True
+            elif not touched and now - last_event > EVENT_COOLDOWN:
+                if flipped and not prev_flipped:        # real flip (not a petting press)
+                    event, allow_move = "You were just tilted or flipped over!", False
+                elif picked and not prev_pick:
+                    event, allow_move = "Someone just picked you up off the ground.", False
+                elif prev_pick and not picked:
+                    event = "You were just put back down on a surface."
+                elif shake >= 3:
+                    event, allow_move = "Someone is shaking you.", False
         prev_touch, prev_pick, prev_flipped = touched, picked, flipped
 
         if event:

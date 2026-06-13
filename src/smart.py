@@ -44,6 +44,10 @@ EMO = {
     'CELEBRATE': 'OnboardingResetSuccess', 'LOVE': 'PettingBlissGetout',
     'SASSY': 'PettingBlissGetout', 'EYEROLL': 'Feedback_ShutUp',
     'NEUTRAL': 'NeutralFace', 'DARTINGEYES': 'KnowledgeGraphListening',
+    # synonyms the LLM tends to use
+    'EXCITED': 'OnboardingResetSuccess', 'PLAYFUL': 'ComeHereSuccess',
+    'DIZZY': 'MeetVictorConfusion', 'SCARED': 'TakeAPictureFocusing',
+    'WIDE': 'TakeAPictureFocusing', 'SHY': 'PettingBlissGetout',
 }
 
 # Friendly eye colours (hue, saturation).
