@@ -208,6 +208,39 @@ def _bg(fn):
     threading.Thread(target=fn, daemon=True).start()
 
 
+def speak_line(text):
+    """Say a short line NOW through Vector's speaker — used to VOICE errors so the
+    user actually HEARS that something went wrong (not just a silent log line)."""
+    if not text or ROBOT is None:
+        print(f"[speak] (no body) {text}")
+        return
+    try:
+        wav = VOICE.synthesize(clean_spoken(text))
+        if wav:
+            ROBOT.say_wav(wav)
+        print(f"[speak] {text}")
+    except Exception as exc:
+        print(f"[speak] failed: {exc}")
+
+
+def _run_action(token):
+    """Run one body-action token; if it FAILS, say the error out loud so the user
+    knows (e.g. 'em không tới được đế sạc'), instead of failing silently."""
+    if ROBOT is None:
+        return
+    try:
+        res = ROBOT.act(token)
+    except Exception as exc:
+        print(f"[act] {token} raised: {exc}")
+        res = False
+    if res is False:
+        u = token.strip().upper()
+        if u.startswith(("CHARGE", "GOCHARGE")):
+            speak_line("Em không tới được đế sạc rồi, anh đặt em lên giúp với nha.")
+        else:
+            speak_line("Em gặp trục trặc, không làm được động tác đó.")
+
+
 def _tool_act(a):
     if not ROBOT:
         return "(no body)"
@@ -221,7 +254,7 @@ def _tool_act(a):
         token = _ACT_MAP.get(action)
     if not token:
         return f"(unknown action {action})"
-    _bg(lambda: ROBOT.act(token))
+    _bg(lambda: _run_action(token))     # speaks the error if it fails
     return f"started: {action}"
 
 
@@ -454,7 +487,7 @@ def act_async(reply: str, speak_via_sdk: bool, frame_provider=None, allow_move=T
         u = c.strip().upper()
         if u in ("SILENT", "LOOK"):
             continue
-        ROBOT.act(c)
+        _run_action(c)              # speaks the error out loud if the action fails
     return spoken
 
 

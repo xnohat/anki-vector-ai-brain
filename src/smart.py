@@ -630,7 +630,7 @@ class SmartVector:
             elif c.startswith('DANCE'):
                 self.dance()
             elif c.startswith('CHARGE') or c.startswith('GOCHARGE'):
-                self.return_to_charger()
+                return self.return_to_charger()
             elif c.startswith('STOP'):
                 self.stop()
             elif c.startswith('EMOTE_'):
@@ -654,6 +654,7 @@ class SmartVector:
                 self.drive(80, -80, _num(c, 1))
         except Exception as exc:
             print(f"[smart] action '{command}' failed: {exc}")
+            return False
 
 
 def _num(token: str, default: float) -> float:
