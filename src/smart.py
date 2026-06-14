@@ -388,12 +388,22 @@ class SmartVector:
         except Exception:
             pass
 
-    def return_to_charger(self) -> None:
+    def return_to_charger(self) -> bool:
+        """Drive onto the charger. Returns True if he ends up docked. Logs the
+        outcome (the old silent 'except: pass' hid the common 'already docked'
+        and 'can't see the charger' cases, so it looked like he ignored you)."""
         with self.control():
             try:
-                _wait(self.robot.behavior.drive_on_charger())
-            except Exception:
-                pass
+                if self.robot.status.is_on_charger:
+                    print("[smart] return_to_charger: already on the charger")
+                    return True
+                _wait(self.robot.behavior.drive_on_charger(), timeout=40)
+                ok = bool(self.robot.status.is_on_charger)
+                print(f"[smart] return_to_charger: {'docked' if ok else 'could NOT find/reach the charger'}")
+                return ok
+            except Exception as exc:
+                print(f"[smart] return_to_charger failed: {exc}")
+                return False
 
     # -------------------------------------------------------------- actions
     def emote(self, name: str) -> None:

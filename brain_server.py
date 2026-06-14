@@ -251,6 +251,12 @@ _TRICK_KW = ("fist", "wheelie", "dance", "celebrat", "pounce", "petting", "cube"
              "fetch", "greet", "laugh", "happy", "comehere", "victory")
 _builtin = sorted(set(t for t in (ROBOT.triggers if ROBOT else [])
                       if any(k in t.lower() for k in _TRICK_KW)))[:50]
+if ROBOT and ROBOT.triggers:                     # dump full firmware anim vocab once
+    try:
+        with open("/tmp/vector-triggers.txt", "w") as _fh:
+            _fh.write("\n".join(sorted(set(ROBOT.triggers))))
+    except Exception:
+        pass
 
 BODY_TOOLS = [
     {"type": "function", "function": {
