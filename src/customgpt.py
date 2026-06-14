@@ -229,8 +229,10 @@ class CustomGPT:
 
     def stream_answer(self, query: str, image: PIL.Image.Image = None, memories: str = None):
         """Generator: stream Vector's reply token-by-token (fast first word for the
-        voice path). No tools. Stores the full reply in history; the full text is
-        left in self.last_full for the caller to parse @COMMAND@ tokens."""
+        voice path) WITH tools. The agent can call tools (memory_search, look,
+        act, ...) mid-thought: a tool-calling round streams no words, we execute
+        the tools, then the next round streams the spoken answer. A plain answer
+        streams immediately (no tool round-trip). Full text -> self.last_full."""
         self.last_full = ""
         if not query and image is None:
             return
@@ -250,19 +252,50 @@ class CustomGPT:
 
         full = ""
         try:
-            stream = self.client.chat.completions.create(
-                model=self.model, temperature=1.0, messages=call_messages, stream=True)
-            for chunk in stream:
-                try:
-                    delta = chunk.choices[0].delta.content
-                except Exception:
-                    delta = None
-                if delta:
-                    full += delta
-                    yield delta
+            for _ in range(5):       # agentic loop: resolve tools, then stream words
+                kwargs = dict(model=self.model, temperature=1.0,
+                              messages=call_messages, stream=True)
+                if self.tools:
+                    kwargs["tools"] = self.tools
+                content = ""
+                tool_acc = {}        # index -> {id, name, args}
+                for chunk in self.client.chat.completions.create(**kwargs):
+                    try:
+                        delta = chunk.choices[0].delta
+                    except Exception:
+                        delta = None
+                    if delta is None:
+                        continue
+                    if getattr(delta, "content", None):
+                        content += delta.content
+                        full += delta.content
+                        yield delta.content
+                    for tc in (getattr(delta, "tool_calls", None) or []):
+                        slot = tool_acc.setdefault(
+                            tc.index, {"id": "", "name": "", "args": ""})
+                        if tc.id:
+                            slot["id"] = tc.id
+                        if tc.function and tc.function.name:
+                            slot["name"] = tc.function.name
+                        if tc.function and tc.function.arguments:
+                            slot["args"] += tc.function.arguments
+                if not tool_acc:
+                    break            # plain answer -> streamed content IS the reply
+                # Execute the tool calls, append results, loop (next round speaks).
+                call_messages.append({
+                    "role": "assistant", "content": content or None,
+                    "tool_calls": [{"id": s["id"], "type": "function",
+                                    "function": {"name": s["name"], "arguments": s["args"]}}
+                                   for s in tool_acc.values()]})
+                for s in tool_acc.values():
+                    out = self._run_tool(s["name"], s["args"])
+                    print(f"[tool] {s['name']}({s['args']}) -> {str(out)[:80]}")
+                    call_messages.append({"role": "tool", "tool_call_id": s["id"],
+                                          "content": out})
         except Exception as exc:
             print(f"[customgpt] stream failed: {exc}")
-            self.messages.pop()
+            if self.messages and self.messages[-1]["role"] == "user":
+                self.messages.pop()
             return
         if image is not None:
             self.messages[-1]["content"] = (query or "What do you see right now?") + " [camera image]"

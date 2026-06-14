@@ -105,8 +105,10 @@ echo "=== [1/4] Ensuring wire-pod has the Brain bridge ==="
 echo "=== [2/4] Starting Vector Brain server (port $BRAIN_PORT) ==="
 # Fast cloud STT (OpenAI) so the robot's voice request doesn't time out.
 export VECTOR_STT_BACKEND="${VECTOR_STT_BACKEND:-openai}"
-# Keep Vector awake so his reflexes don't pause when idle (set 0 in .env to disable).
-export VECTOR_STAY_AWAKE="${VECTOR_STAY_AWAKE:-1}"
+# Let Vector's NATIVE firmware freeplay run when idle (the cute built-in
+# behaviours). Stay-awake grabs control periodically and would suppress them, so
+# it's OFF by default; set VECTOR_STAY_AWAKE=1 in .env only if reflexes pause.
+export VECTOR_STAY_AWAKE="${VECTOR_STAY_AWAKE:-0}"
 "$HERE/.venv/bin/python" -u brain_server.py >/tmp/vector-brain.log 2>&1 &
 BRAIN_PID=$!
 echo "    brain server pid $BRAIN_PID (log: /tmp/vector-brain.log)"

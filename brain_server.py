@@ -309,12 +309,21 @@ def _tool_catalogue(tools) -> str:
 
 
 GPT.messages[0]["content"] += (
-    "\n\n---\n# Your tools (call them to sense, act, remember)\n"
+    "\n\n---\n# Your tools\n"
     + _tool_catalogue(_ALL_TOOLS)
-    + "\nJudge from your live body/sensor state and memory below; call tools when "
-    "you need fresh info or to act (e.g. low battery -> act(return_to_charger); "
-    "hear music / very happy -> act(dance)). Keep spoken words in your reply for "
-    "the user; tool calls are silent."
+    + "\n\nIMPORTANT — how to use them:\n"
+    "- Your live body & world sensor state (battery, on_charger, being_held, "
+    "picked_up, cliff, proximity, tilt, faces) is ALREADY given to you every turn "
+    "in the context below. It is PUSHED to you — do NOT waste a call on 'sense'.\n"
+    "- Only your eyes and ears cost extra, so PULL them on demand: call 'look' to "
+    "actually SEE through your camera when it matters.\n"
+    "- ACTIVELY call 'memory_search'/'memory_get' to recall who someone is, past "
+    "moments, or what you learned — be a robot with real memory, not a goldfish.\n"
+    "- Use 'act'/'set_eyes'/'emote'/'vector_intent' to move your body when it adds "
+    "to the moment (low battery -> act(return_to_charger); hear music / very happy "
+    "-> act(dance)).\n"
+    "Tool calls are silent; only the words in your reply are spoken. When nothing "
+    "needs doing, a short reply (or none) is fine — let your natural behaviours be."
 )
 
 
@@ -583,19 +592,20 @@ def curiosity_explore():
             messages=[{"role": "system", "content": LIGHT_SYS},
                       {"role": "user", "content": [
                 {"type": "text", "text":
-                    "You are a curious little robot looking around the room. Say ONE "
-                    "short line about something interesting you see or learn, with "
-                    "@EYE_curious@ or @LOOKAROUND@. If nothing is new, just @SILENT@."},
+                    "You are a curious little robot quietly looking around the room. "
+                    "Note ONE interesting thing you see (for your own memory), with "
+                    "@LOOKAROUND@ or @EYE_curious@. If nothing is new, just @SILENT@."},
                 {"type": "image_url", "image_url": {"url": url}}]}])
         reply = (r.choices[0].message.content or "@SILENT@").strip()
     except Exception as exc:
         print(f"[curious] {exc}")
         return
-    said = act_async(reply, speak_via_sdk=True, allow_move=False)
+    # Look around (body) + LEARN silently to memory — do NOT narrate aloud.
+    act_async(reply, speak_via_sdk=False, allow_move=False)
     learned = clean_spoken(reply)
     if learned and learned != "...":
         MEMORY.remember(f"Observed/learned: {learned}", tag="learn")
-        print(f"[curious] {learned}")
+        print(f"[curious] learned (silent): {learned}")
 
 
 # --------------------------------------------------------------------------- #
@@ -612,60 +622,90 @@ def _dog_sys() -> str:
     if _DOG_SYS is None:
         _DOG_SYS = (
             MEMORY.identity() + "\n\n"
-            "You are a real, playful, loving robot DOG-pet. In quiet moments you do "
-            "little things ON YOUR OWN — spontaneous, SURPRISING and delightful, full "
-            f"of personality, NEVER repetitive. Reply in {SPEAK_LANG}: ONE short line "
-            "(or @SILENT@) plus fitting action tokens. Address your human by name when "
-            "you can. No emojis, no asterisks.\n" + SHORT_ACTIONS
+            "You are a real robot DOG-pet. A dog expresses itself with its BODY, "
+            "NOT by talking — it never narrates its day or chatters to itself. In "
+            "quiet moments you do small spontaneous physical dog-things. By DEFAULT "
+            "output ONE action token and NO words at all (just the token). Add a "
+            "very short spoken line ONLY on the rare occasion your human is right "
+            "in front of you AND there is a genuine reason — never random, "
+            "unrelated small-talk. No emojis, no asterisks.\n" + SHORT_ACTIONS
         )
     return _DOG_SYS
 
 
 def dog_tick(faces: int, on_charger) -> None:
-    """One lively, surprising playful-dog moment."""
+    """One lively playful-dog moment — BODY language first, words rare."""
     recent = "; ".join(_RECENT[-4:])
+    human = faces > 0
     sit = (
-        f"A quiet moment. human_in_sight={faces > 0}, on_charger={on_charger}. "
-        "Do ONE spontaneous DOG thing now and a short line — pick something DIFFERENT "
-        "from recently and surprise me: curious head-tilt @HEADTILT@, ears-up @PERKUP@, "
-        "happy zoomies @SPIN@, wag @CUDDLE@/@WIGGLE@, sit up & beg @BEG@, dance @DANCE@, "
-        "look around @LOOKAROUND@, change eye colour, or murmur something sweet/sassy. "
-        "If your human is in sight and you're NOT on charger you may roll over and nuzzle "
-        "@NUZZLE@ with a loving line. If on charger or no human: don't drive — head-tilt/"
-        "emote/talk only. About 1 in 3 times just rest (@SILENT@)."
-        + (f"\n\nRecently you already did/said: {recent} — do NOT repeat these." if recent else "")
+        f"A quiet moment. human_in_sight={human}, on_charger={on_charger}. "
+        "Do ONE spontaneous physical DOG thing, DIFFERENT from recently: curious "
+        "head-tilt @HEADTILT@, ears-up @PERKUP@, happy zoomies @SPIN@, wag "
+        "@WIGGLE@, sit up & beg @BEG@, dance @DANCE@, look around @LOOKAROUND@, or "
+        "change eye colour. Output JUST the action token, with NO words. "
+        + ("Your human is in front of you — you MAY add one short, relevant line, "
+           "and may roll over to nuzzle @NUZZLE@/@APPROACH@ (only if off charger). "
+           if human else
+           "You are alone — stay WORDLESS, body language only, and do NOT drive. ")
+        + "Often just rest: @SILENT@."
+        + (f"\nRecently: {recent} — do something different." if recent else "")
     )
     try:
         r = GPT.client.chat.completions.create(
-            model=REACT_MODEL, max_tokens=90, temperature=1.2,
+            model=REACT_MODEL, max_tokens=80, temperature=1.2,
             messages=[{"role": "system", "content": _dog_sys()},
                       {"role": "user", "content": sit}])
         reply = (r.choices[0].message.content or "@SILENT@").strip()
     except Exception as exc:
         print(f"[auto] {exc}")
         return
-    said = act_async(reply, speak_via_sdk=True, allow_move=(faces > 0 and not on_charger))
+    # HARD RULE: never talk to an empty room. When alone he only does dog actions
+    # (silent); he may speak only when his human is actually in front of him.
+    said = act_async(reply, speak_via_sdk=human, allow_move=(human and not on_charger))
     if said:
         _RECENT.append(said)
         del _RECENT[:-6]
-        print(f"[auto] {said}")
+        print(f"[auto] {'spoke' if human else 'silent'}: {said}")
+
+
+def greet_owner(snap: dict) -> None:
+    """The ONE meaningful autonomous moment: when the owner reappears after being
+    away, give a warm, memory-aware greeting (the wanted 'em nhớ anh' moment),
+    then hand the body straight back to native freeplay. Not idle chatter."""
+    name = (snap.get("face_names") or [None])[0]
+    who = f"your human {name}" if name else "your human"
+    react(f"{who} just came back into view after being away for a while. You "
+          "missed them — approach and greet them warmly with ONE short, heartfelt "
+          "line.", allow_move=True)
 
 
 def autonomous_loop():
+    """Smart, mostly-IDLE agent. The world sensor state is PUSHED into context
+    continuously (reflex loop, ~3s), so the agent already knows it without any
+    tool call. Here Vector mostly RESTS so his native firmware freeplay (the
+    built-in funny behaviours) runs uninterrupted — he only steps in for
+    something that genuinely matters, using memory + context to be smart, not
+    chatty. Camera (eyes) and mic (ears) are touched ONLY on demand via tools."""
+    prev_faces = 0
+    last_greet = 0.0
     while True:
         time.sleep(AGENT_INTERVAL)
         if not AUTONOMOUS or ROBOT is None or busy():
             continue
-        _TICK["n"] += 1
+        snap = _STATE.get("sense") or {}          # pushed world context — no RPC here
+        faces = snap.get("faces_visible", 0)
+        on_charger = snap.get("on_charger")
+        now = time.time()
         try:
-            faces = ROBOT.sense().get("faces_visible", 0)
-            _, charging, on_charger = ROBOT.battery()
-            if _TICK["n"] % CURIOSITY_EVERY == 0:   # sometimes look + learn
-                curiosity_explore()
-            else:                                    # otherwise a playful-dog moment
-                dog_tick(faces, on_charger)
+            # Owner just reappeared after being away -> one heartfelt greeting.
+            # Otherwise do NOTHING: don't grab control, don't talk -> let his
+            # native freeplay behaviours be Vector.
+            if faces > 0 and prev_faces == 0 and not on_charger and now - last_greet > 300:
+                last_greet = now
+                greet_owner(snap)
         except Exception as exc:
             print(f"[auto] tick failed: {exc}")
+        prev_faces = faces
 
 
 # --------------------------------------------------------------------------- #
@@ -909,7 +949,7 @@ class Handler(BaseHTTPRequestHandler):
             self._stream_live(user, frame, ctx)        # fast first word
         else:
             with _BRAIN_LOCK:
-                raw = GPT.get_answer(user, image=frame, memories=ctx, use_tools=False)
+                raw = GPT.get_answer(user, image=frame, memories=ctx, use_tools=True)
             spoken = clean_spoken(raw) or "..."
             print(f"[chat] vector: {spoken!r}  ({parse_commands(raw)})")
             threading.Thread(target=_deferred_act, args=(raw,), daemon=True).start()
