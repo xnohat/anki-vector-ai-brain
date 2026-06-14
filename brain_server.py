@@ -683,6 +683,8 @@ NEAR_MM = float(os.environ.get("VECTOR_NEAR_MM", "70"))
 def reflex_loop():
     prev_touch = prev_pick = prev_cliff = prev_flipped = prev_near = False
     last_event = last_batt = batt_check = last_snap = touch_start = 0.0
+    flip_latched = False          # fire the flip reaction ONCE, not on a loop
+    upright_since = 0.0           # re-arm only after he's been clearly upright a moment
     prev_prox = None
     shake = 0
     while True:
@@ -733,6 +735,16 @@ def reflex_loop():
 
         flipped = tilt < FLIP_TILT
         upside_down = tilt < 0.15                 # fully inverted vs just on its side
+        # Re-arm the flip reaction only after he's been CLEARLY upright (>0.95)
+        # for a sustained moment. While he stays flipped (or the accelerometer
+        # jitters near the threshold, or a reconnect returns garbage), the latch
+        # holds — so he reacts ONCE per real flip instead of repeating endlessly.
+        if tilt <= 0.95:
+            upright_since = 0.0
+        elif upright_since == 0.0:
+            upright_since = now
+        if upright_since and now - upright_since > 1.5:
+            flip_latched = False
         near = prox is not None and prox < NEAR_MM
         docked = bool(_STATE.get("sense", {}).get("on_charger"))
         if not touched:
@@ -753,7 +765,8 @@ def reflex_loop():
                     "Your owner has been rubbing your back for a while now — pure bliss."
                     if long_rub else "Your owner is petting your back."), True
             elif not touched and now - last_event > EVENT_COOLDOWN:
-                if flipped and not prev_flipped:        # real flip (not a petting press)
+                if flipped and not flip_latched:        # real flip (not a petting press)
+                    flip_latched = True                 # latch: don't repeat until upright
                     event, allow_move = (
                         "You've been turned completely UPSIDE-DOWN — the world is inverted!"
                         if upside_down else
@@ -797,6 +810,10 @@ def reflex_loop():
                     react(situation, allow_move=allow_move)
             except Exception as exc:
                 print(f"[reflex] {exc}")
+            # A reaction blocks this loop for ~15s (LLM + TTS playback); refresh
+            # the heartbeat so body_manager doesn't mistake that for a dead link
+            # and reconnect (which would re-trigger reflexes in a loop).
+            _STATE["body_ts"] = time.time()
             continue
 
         # ---- battery low -> yell for help + crawl back to the charger ----
@@ -1075,8 +1092,8 @@ def body_manager():
         alive_ts = max(_STATE.get("body_ts", 0), _STATE.get("voice_active", 0),
                        _STATE.get("touch_ts", 0), _STATE.get("button_ts", 0),
                        getattr(ROBOT, "last_action", 0))
-        if time.time() - alive_ts > 30:
-            print("[body] connection stale (idle, no heartbeat 30s); reconnecting")
+        if time.time() - alive_ts > 45:
+            print("[body] connection stale (idle, no heartbeat 45s); reconnecting")
             try:
                 ROBOT.disconnect()
             except Exception:
