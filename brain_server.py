@@ -56,6 +56,10 @@ TOUCH_ENABLED = os.environ.get("VECTOR_TOUCH", "1") not in ("0", "false", "False
 # Body = our SDK connection (movement/sensors). Disable to run voice-only (no SDK),
 # which avoids any contention with the robot's voice channel.
 BODY_ENABLED = os.environ.get("VECTOR_BODY", "1") not in ("0", "false", "False", "")
+# Keep Vector awake (prevents calm/sleep mode from freezing his sensors) with a
+# gentle periodic nudge. Skipped during voice/touch so it doesn't break a chat.
+STAY_AWAKE = os.environ.get("VECTOR_STAY_AWAKE", "0") not in ("0", "false", "False", "")
+AWAKE_INTERVAL = float(os.environ.get("VECTOR_AWAKE_INTERVAL", "25"))
 
 # Action vocabulary the brain can use. Executed by src/smart.py over the SDK.
 ACTIONS = (
@@ -989,6 +993,20 @@ def body_manager():
             ROBOT = None
 
 
+def keep_awake_loop():
+    """Gently keep Vector awake so his sensors/reflexes don't pause when idle.
+    A brief control touch resets his sleep timer; skipped during voice/touch."""
+    while True:
+        time.sleep(AWAKE_INTERVAL)
+        if not STAY_AWAKE or ROBOT is None or busy():
+            continue
+        try:
+            with ROBOT.control():
+                time.sleep(0.15)        # brief active presence = "stay awake"
+        except Exception:
+            pass
+
+
 def main():
     # Loops run always and self-guard on ROBOT being None, so the brain (voice)
     # never depends on the body being connected.
@@ -1001,6 +1019,9 @@ def main():
     if BODY_ENABLED:
         threading.Thread(target=body_manager, daemon=True).start()
         print("[brain] body manager ON (auto-connect/reconnect, never blocks voice)")
+    if STAY_AWAKE:
+        threading.Thread(target=keep_awake_loop, daemon=True).start()
+        print(f"[brain] stay-awake ON (nudge every {AWAKE_INTERVAL:.0f}s)")
     threading.Thread(target=dream_loop, daemon=True).start()
     server = ThreadingHTTPServer((HOST, PORT), Handler)
     print(f"[brain] listening on http://{HOST}:{PORT}  (/stt, /v1)")
