@@ -41,6 +41,25 @@ def _wait(x, timeout: float = 12.0):
 _SDK_CONFIG = os.path.expanduser("~/.anki_vector/sdk_config.ini")
 
 
+def _force_close(robot) -> None:
+    """Tear a robot connection down so its gRPC socket is ALWAYS freed.
+
+    Robot.disconnect() closes the underlying channel (conn.close()) only after
+    closing ~8 subsystems; any of those throwing (half-initialised robot from a
+    failed connect, or a close-RPC hanging on a laggy link) skips conn.close()
+    and orphans the socket. Leaked sockets accumulate and saturate Vector until
+    it can no longer grant control. So: try the graceful disconnect, then ALWAYS
+    force the channel closed underneath it."""
+    try:
+        robot.disconnect()
+    except Exception:
+        pass
+    try:
+        robot.conn.close()          # idempotent; guarantees the channel/socket is freed
+    except Exception:
+        pass
+
+
 def _is_vector(ip: str, certfile: str, name: str, timeout: float = 2.0) -> bool:
     """True iff `ip:443` presents Vector's pinned self-signed cert (definitely him)."""
     try:
@@ -161,10 +180,13 @@ class SmartVector:
             except Exception as exc:
                 last_exc = exc
                 print(f"[smart] connect attempt {attempt + 1}/3 failed: {exc}")
-                try:
-                    self.robot.disconnect()
-                except Exception:
-                    pass
+                # MUST fully close the half-open channel or its socket leaks. A
+                # failed connect already created the gRPC channel (control request
+                # is the LAST step), and Robot.disconnect() closes the socket only
+                # AFTER ~8 subsystem closes that throw on a half-init robot -> the
+                # socket is orphaned. Leaked sockets pile up and saturate Vector
+                # until nothing can get control ("Failed to get control" forever).
+                _force_close(self.robot)
                 time.sleep(6)
         if last_exc is not None:
             raise last_exc
@@ -199,10 +221,7 @@ class SmartVector:
         return self.battery()[0] is not None
 
     def disconnect(self) -> None:
-        try:
-            self.robot.disconnect()
-        except Exception:
-            pass
+        _force_close(self.robot)
 
     # -------------------------------------------------------------- control
     @contextmanager
