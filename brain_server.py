@@ -44,6 +44,13 @@ STT_BACKEND = os.environ.get("VECTOR_STT_BACKEND", "openai").lower()
 STT_API_MODEL = os.environ.get("VECTOR_STT_API_MODEL", "gpt-4o-mini-transcribe")
 STT_API_LANG = os.environ.get("VECTOR_STT_LANG", "vi")
 AGENT_INTERVAL = float(os.environ.get("VECTOR_AGENT_INTERVAL", "15"))
+# Hands-free conversation: after each spoken reply, re-open Vector's mic so the
+# user can keep talking WITHOUT pressing the backpack button again (wire-pod
+# parses {{newVoiceRequest||now}} and re-issues the listen intent). Stops on a
+# clear goodbye. 1 = on.
+CONVO_FOLLOWUP = os.environ.get("VECTOR_CONVO_FOLLOWUP", "1") not in ("0", "false", "")
+CONVO_END_WORDS = ("tạm biệt", "tam biet", "bye", "ngủ ngon", "ngu ngon",
+                   "hẹn gặp", "hen gap", "chào nhé", "chao nhe", "gặp lại", "đi ngủ")
 # Cheap model for the constant autonomous/reflex ticks (runs all day) — keep it
 # small + stateless so token cost stays tiny. gpt-5.5 is only for voice chats.
 AUTO_MODEL = os.environ.get("VECTOR_AUTO_MODEL", "gpt-4o-mini")
@@ -1038,6 +1045,12 @@ class Handler(BaseHTTPRequestHandler):
             tail = stripper.flush()
             if tail:
                 send({"content": tail})
+            # Hands-free: re-open the mic for a follow-up so the user keeps talking
+            # without the button. wire-pod parses {{newVoiceRequest||now}} (even
+            # with commands off) -> re-issues the listen intent. Skip on goodbye.
+            full_txt = (getattr(GPT, "last_full", "") or "").lower()
+            if CONVO_FOLLOWUP and full_txt and not any(w in full_txt for w in CONVO_END_WORDS):
+                send({"content": " {{newVoiceRequest||now}}"})
             send({}, "stop")
             self.wfile.write(b"data: [DONE]\n\n"); self.wfile.flush()
         except (BrokenPipeError, ConnectionError):
