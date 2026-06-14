@@ -129,5 +129,20 @@ fi
 
 echo "=== [3/4] Starting wire-pod Brain bridge (needs sudo for port 443) ==="
 cd "$CHIPPER"
+
+# Re-apply the backpack-button -> "Hey Vector" voice-listening setting. A robot
+# REBOOT resets button_wakeword to default, after which pressing the button no
+# longer triggers STT. Re-apply it once wire-pod is up + connected to the robot.
+VECTOR_SERIAL="${VECTOR_SERIAL:-00907f6b}"
+(
+  for i in $(seq 1 30); do
+    if curl -sf --max-time 5 "http://localhost:8080/api-sdk/button_hey_vector?serial=$VECTOR_SERIAL" 2>/dev/null | grep -q done; then
+      echo "    [button] backpack button -> Hey Vector voice listening: re-applied"
+      break
+    fi
+    sleep 3
+  done
+) &
+
 echo "=== [4/4] Say 'Hey Vector' / press the backpack button and speak. ==="
 exec sudo -E STT_SERVICE=brain BRAIN_STT_URL="http://127.0.0.1:$BRAIN_PORT/stt" ./start.sh
