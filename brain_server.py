@@ -16,6 +16,7 @@ Run via ../run.sh  (or: .venv/bin/python brain_server.py)
 """
 
 import sys
+import signal
 sys.path.insert(1, 'src')
 
 import os
@@ -360,7 +361,8 @@ def transcribe(wav_path: str) -> str:
 
 _TOKEN_RE = re.compile(r"@.*?@")
 _BRAIN_LOCK = threading.Lock()          # serialize GPT calls across threads
-_STATE = {"voice_active": 0.0, "button_ts": 0.0, "touch_ts": 0.0, "sense": {}}
+_STATE = {"voice_active": 0.0, "button_ts": 0.0, "touch_ts": 0.0,
+          "sense": {}, "sense_ts": 0.0}
 VISION_WORDS = ("thấy", "nhìn", "xem", "see", "look", "đọc", "màu", "ai ", "gì",
                 "what", "who", "camera", "trước mặt")
 
@@ -698,15 +700,22 @@ def reflex_loop():
             moving_now = ROBOT.moving()
         except Exception:
             continue
+        # Heartbeat: these cached reads succeed at 10Hz only while the SDK link is
+        # alive, so this is the body's liveness signal — independent of the slow
+        # sense() RPC and of long inline reactions that block this loop.
+        _STATE["body_ts"] = now
         if button:
             _STATE["button_ts"] = now
         if touched:
             _STATE["touch_ts"] = now
         # Cache a full sensor snapshot (~3s) so the voice path needs no RPC.
+        # The freshness of this snapshot is ALSO the body's liveness heartbeat
+        # (body_manager watches sense_ts) — so it needs no competing battery RPC.
         if now - last_snap > 3:
             last_snap = now
             try:
                 _STATE["sense"] = ROBOT.sense()
+                _STATE["sense_ts"] = now
             except Exception:
                 pass
 
@@ -1052,16 +1061,22 @@ def body_manager():
         if ROBOT is None:
             try:
                 ROBOT = SmartVector()
+                _STATE["body_ts"] = time.time()    # grace period before first probe
                 print("[body] SDK body connected")
             except Exception:
                 time.sleep(20)            # robot asleep/unreachable -> try later
                 continue
         time.sleep(15)
-        try:
-            if not ROBOT.healthy():       # stale/zombie connection
-                raise RuntimeError("stale connection")
-        except Exception as exc:
-            print(f"[body] connection lost ({exc}); will reconnect")
+        # Liveness without a competing RPC: the connection is alive if the reflex
+        # loop's 10Hz heartbeat is fresh, OR we've recently acted / talked / been
+        # touched (all prove the link works). A long inline reaction or a voice
+        # turn therefore never looks "dead" — which is what caused the needless
+        # reconnect flapping and the lag right after interacting.
+        alive_ts = max(_STATE.get("body_ts", 0), _STATE.get("voice_active", 0),
+                       _STATE.get("touch_ts", 0), _STATE.get("button_ts", 0),
+                       getattr(ROBOT, "last_action", 0))
+        if time.time() - alive_ts > 30:
+            print("[body] connection stale (idle, no heartbeat 30s); reconnecting")
             try:
                 ROBOT.disconnect()
             except Exception:
@@ -1083,7 +1098,22 @@ def keep_awake_loop():
             pass
 
 
+def _shutdown(signum=None, frame=None):
+    """Release Vector's behaviour control on exit. Without this, a SIGTERM (e.g.
+    `systemctl restart`) kills the brain while it still holds control, leaving a
+    zombie session that blocks the next start for ~60s ('Failed to get control')."""
+    print("[brain] shutting down; releasing Vector control...")
+    try:
+        if ROBOT is not None:
+            ROBOT.disconnect()
+    except Exception:
+        pass
+    os._exit(0)
+
+
 def main():
+    signal.signal(signal.SIGTERM, _shutdown)
+    signal.signal(signal.SIGINT, _shutdown)
     # Loops run always and self-guard on ROBOT being None, so the brain (voice)
     # never depends on the body being connected.
     if AUTONOMOUS:
@@ -1104,7 +1134,7 @@ def main():
     try:
         server.serve_forever()
     except KeyboardInterrupt:
-        ROBOT.disconnect()
+        _shutdown()
 
 
 if __name__ == "__main__":
