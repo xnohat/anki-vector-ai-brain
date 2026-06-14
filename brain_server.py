@@ -543,14 +543,16 @@ def _react_sys() -> str:
 
 
 def react(situation: str, speak: bool = True, allow_move: bool = True) -> None:
-    """Rich, in-character reaction to a sensor event (knows you + your memory)."""
+    """In-character reaction to a sensor event. STATELESS on purpose: it reacts
+    ONLY to the situation handed in, with no memory recall / chat-history — that
+    all-day context was bleeding past events (e.g. an old flip) into unrelated
+    reactions and making him babble about things that aren't happening. Full
+    context is for the voice conversation path only."""
     try:
-        mem = MEMORY.recall(situation + " my owner human", k=3)
-        usr = situation + (f"\n\n(What you remember:\n{mem})" if mem else "")
         r = GPT.client.chat.completions.create(
             model=REACT_MODEL, max_tokens=90, temperature=1.1,
             messages=[{"role": "system", "content": _react_sys()},
-                      {"role": "user", "content": usr}])
+                      {"role": "user", "content": situation}])
         reply = (r.choices[0].message.content or "").strip()
     except Exception as exc:
         print(f"[react] failed: {exc}")
@@ -752,8 +754,11 @@ def autonomous_loop():
 # --------------------------------------------------------------------------- #
 SHAKE_GYRO = float(os.environ.get("VECTOR_SHAKE_GYRO", "8"))
 # tilt = cos(angle from upright): 1=level, 0=on side, -1=upside down. Trigger a
-# flip/tilt reaction below this (0.85 ~= 32 deg tilt; lower = needs a bigger flip).
-FLIP_TILT = float(os.environ.get("VECTOR_FLIP_TILT", "0.85"))
+# flip reaction below this. 0.6 ~= 53 deg — firm, so a mild lean/bump or sensor
+# noise does NOT count as a flip (was 0.85 ~ 32 deg = too twitchy -> false flips).
+FLIP_TILT = float(os.environ.get("VECTOR_FLIP_TILT", "0.6"))
+# He must STAY tilted this long (s) before it counts — kills transient blips.
+FLIP_SUSTAIN = float(os.environ.get("VECTOR_FLIP_SUSTAIN", "1.0"))
 EVENT_COOLDOWN = float(os.environ.get("VECTOR_EVENT_COOLDOWN", "6"))
 # Something this close (mm) to his face counts as a hand/toy at his nose.
 NEAR_MM = float(os.environ.get("VECTOR_NEAR_MM", "70"))
@@ -764,6 +769,7 @@ def reflex_loop():
     last_event = last_batt = batt_check = last_snap = touch_start = 0.0
     flip_latched = False          # fire the flip reaction ONCE, not on a loop
     upright_since = 0.0           # re-arm only after he's been clearly upright a moment
+    flip_since = 0.0              # how long he's been continuously tilted (sustain)
     prev_prox = None
     shake = 0
     while True:
@@ -812,8 +818,16 @@ def reflex_loop():
         suppress = (now - _STATE["voice_active"] < VOICE_BACKOFF) or \
                    (now - _STATE.get("button_ts", 0) < 6)
 
-        flipped = tilt < FLIP_TILT
-        upside_down = tilt < 0.15                 # fully inverted vs just on its side
+        # A flip counts ONLY if he stays tilted past FLIP_TILT continuously for
+        # FLIP_SUSTAIN seconds — a transient dip (a bump, a hand, sensor noise)
+        # no longer fires a false "I'm flipped!".
+        if tilt < FLIP_TILT:
+            if flip_since == 0.0:
+                flip_since = now
+        else:
+            flip_since = 0.0
+        flipped = bool(flip_since and now - flip_since > FLIP_SUSTAIN)
+        upside_down = flipped and tilt < 0.15     # fully inverted vs just on its side
         # Re-arm the flip reaction only after he's been CLEARLY upright (>0.95)
         # for a sustained moment. While he stays flipped (or the accelerometer
         # jitters near the threshold, or a reconnect returns garbage), the latch
@@ -846,6 +860,7 @@ def reflex_loop():
             elif not touched and now - last_event > EVENT_COOLDOWN:
                 if flipped and not flip_latched:        # real flip (not a petting press)
                     flip_latched = True                 # latch: don't repeat until upright
+                    print(f"[reflex] FLIP fired: tilt={tilt:.2f} (sustained {now-flip_since:.1f}s)")
                     event, allow_move = (
                         "You've been turned completely UPSIDE-DOWN — the world is inverted!"
                         if upside_down else
