@@ -11,8 +11,12 @@ coexists with wire-pod's voice pipeline.
 - say()    -> speak Vietnamese through Vector's speaker (autonomous/touch path)
 """
 
+import os
+import ssl
 import time
+import socket
 import threading
+import configparser
 import concurrent.futures
 from contextlib import contextmanager
 
@@ -34,6 +38,79 @@ def _wait(x, timeout: float = 12.0):
     return x
 
 
+_SDK_CONFIG = os.path.expanduser("~/.anki_vector/sdk_config.ini")
+
+
+def _is_vector(ip: str, certfile: str, name: str, timeout: float = 2.0) -> bool:
+    """True iff `ip:443` presents Vector's pinned self-signed cert (definitely him)."""
+    try:
+        ctx = ssl.create_default_context(cafile=certfile)
+        ctx.check_hostname = False                # cert CN is the robot name, not the IP
+        with socket.create_connection((ip, 443), timeout=timeout) as raw:
+            with ctx.wrap_socket(raw, server_hostname=name):
+                return True
+    except Exception:
+        return False
+
+
+def _port_open(ip: str, timeout: float = 0.4) -> bool:
+    try:
+        with socket.create_connection((ip, 443), timeout=timeout):
+            return True
+    except Exception:
+        return False
+
+
+def discover_vector_ip() -> str:
+    """Self-heal a DHCP IP change: if the IP in sdk_config.ini no longer answers as
+    Vector, scan the local /24 for the host that presents his pinned cert, rewrite
+    the config, and return the new IP. Returns None if discovery isn't possible.
+
+    Vector connects OUT to wire-pod for voice, so voice keeps working even when his
+    IP moves; but the SDK body connects IN to his IP, so a stale IP silently drops
+    body control back to the firmware. This keeps the body following him."""
+    try:
+        cfg = configparser.ConfigParser()
+        cfg.read(_SDK_CONFIG)
+        if not cfg.sections():
+            return None
+        serial = cfg.sections()[0]
+        cur_ip = cfg.get(serial, "ip", fallback=None)
+        cert = cfg.get(serial, "cert", fallback=None)
+        name = cfg.get(serial, "name", fallback="Vector")
+        if not cert or not os.path.exists(cert):
+            return cur_ip
+        # Still where we think he is? Nothing to do.
+        if cur_ip and _is_vector(cur_ip, cert, name):
+            return cur_ip
+        # Find our /24 and scan it for Vector's cert.
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(("192.168.1.1", 9)); base = s.getsockname()[0]; s.close()
+        except Exception:
+            return cur_ip
+        prefix = base.rsplit(".", 1)[0] + "."
+        hosts = [prefix + str(i) for i in range(1, 255)]
+        print(f"[smart] Vector not at {cur_ip}; scanning {prefix}0/24 for him...")
+        open_hosts = []
+        with concurrent.futures.ThreadPoolExecutor(max_workers=64) as ex:
+            for ip, ok in zip(hosts, ex.map(_port_open, hosts)):
+                if ok:
+                    open_hosts.append(ip)
+        for ip in open_hosts:
+            if _is_vector(ip, cert, name):
+                cfg.set(serial, "ip", ip)
+                with open(_SDK_CONFIG, "w") as fh:
+                    cfg.write(fh)
+                print(f"[smart] found Vector at {ip} (was {cur_ip}); config updated")
+                return ip
+        print("[smart] could not find Vector on the network (asleep/off?)")
+        return cur_ip
+    except Exception as exc:
+        print(f"[smart] ip discovery error: {exc}")
+        return None
+
+
 # Emotion name -> Vector animation trigger.
 EMO = {
     'HAPPY': 'ComeHereSuccess', 'VERYHAPPY': 'GreetAfterLongTime',
@@ -44,6 +121,7 @@ EMO = {
     'CELEBRATE': 'OnboardingResetSuccess', 'LOVE': 'PettingBlissGetout',
     'SASSY': 'PettingBlissGetout', 'EYEROLL': 'Feedback_ShutUp',
     'NEUTRAL': 'NeutralFace', 'DARTINGEYES': 'KnowledgeGraphListening',
+    'CURIOUS': 'KnowledgeGraphSearching', 'INTERESTED': 'KnowledgeGraphSearching',
     # synonyms the LLM tends to use
     'EXCITED': 'OnboardingResetSuccess', 'PLAYFUL': 'ComeHereSuccess',
     'DIZZY': 'MeetVictorConfusion', 'SCARED': 'TakeAPictureFocusing',
@@ -59,6 +137,12 @@ EYE = {
 
 class SmartVector:
     def __init__(self) -> None:
+        # Self-heal a DHCP IP change before connecting: if his configured IP went
+        # stale, find him on the LAN by his pinned cert and rewrite the config.
+        try:
+            discover_vector_ip()
+        except Exception:
+            pass
         args = anki_vector.util.parse_command_args()
         # Connect with retries: a previous (killed) process can leave stale
         # behaviour control on the robot for up to ~60s, which makes connect time
@@ -85,9 +169,6 @@ class SmartVector:
         if last_exc is not None:
             raise last_exc
 
-    def healthy(self) -> bool:
-        """True if the SDK connection is live (a battery RPC returns)."""
-        return self.battery()[0] is not None
         # CRITICAL: do NOT hold behaviour control while idle, or we fight wire-pod
         # (causes the robot to get stuck in the listening/"thinking" state with a
         # looping noise, and blocks voice/button). Release now; grab only to act.
@@ -112,6 +193,10 @@ class SmartVector:
             self.triggers = list(self.robot.anim.anim_trigger_list)
         except Exception:
             pass
+
+    def healthy(self) -> bool:
+        """True if the SDK connection is live (a battery RPC returns)."""
+        return self.battery()[0] is not None
 
     def disconnect(self) -> None:
         try:
@@ -249,6 +334,22 @@ class SmartVector:
     def picked_up(self) -> bool:
         try:
             return bool(self.robot.status.is_picked_up)
+        except Exception:
+            return False
+
+    def proximity(self) -> float:
+        """Distance (mm) to whatever is in front of his face, or None. RPC-free."""
+        try:
+            p = self.robot.proximity.last_sensor_reading
+            if p is not None and p.distance is not None:
+                return float(p.distance.distance_mm)
+        except Exception:
+            pass
+        return None
+
+    def moving(self) -> bool:
+        try:
+            return bool(self.robot.status.are_wheels_moving)
         except Exception:
             return False
 

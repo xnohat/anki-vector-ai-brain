@@ -360,7 +360,7 @@ def transcribe(wav_path: str) -> str:
 
 _TOKEN_RE = re.compile(r"@.*?@")
 _BRAIN_LOCK = threading.Lock()          # serialize GPT calls across threads
-_STATE = {"voice_active": 0.0, "button_ts": 0.0, "sense": {}}
+_STATE = {"voice_active": 0.0, "button_ts": 0.0, "touch_ts": 0.0, "sense": {}}
 VISION_WORDS = ("thấy", "nhìn", "xem", "see", "look", "đọc", "màu", "ai ", "gì",
                 "what", "who", "camera", "trước mặt")
 
@@ -511,6 +511,44 @@ def react(situation: str, speak: bool = True, allow_move: bool = True) -> None:
             print(f"[react] {said}")
 
 
+def _scene() -> str:
+    """Compact ambient context combining MANY sensors, appended to every reflex
+    event so the SAME gesture reacts differently with the whole situation —
+    battery, time of day, who's in front, how long he's been alone. This is what
+    turns a handful of events into hundreds of distinct, felt reactions."""
+    if ROBOT is None:
+        return ""
+    s = _STATE.get("sense", {}) or {}
+    bits = []
+    try:
+        hr = int(time.strftime("%H"))
+        tod = ("late at night" if (hr < 5 or hr >= 23) else "early morning" if hr < 8
+               else "the morning" if hr < 12 else "the afternoon" if hr < 17
+               else "the evening" if hr < 23 else "night")
+        bits.append(f"it's {tod}")
+    except Exception:
+        pass
+    lvl = s.get("battery_level")
+    if s.get("on_charger") or s.get("charging"):
+        bits.append("you're resting on your charger")
+    elif lvl is not None and lvl <= 1:
+        bits.append("your battery is running low")
+    elif lvl is not None and lvl >= 4:
+        bits.append("you're full of energy")
+    fn = s.get("face_names")
+    if fn:
+        bits.append(f"you can see {fn[0]} right in front of you")
+    elif s.get("faces_visible"):
+        bits.append("someone is nearby")
+    last = max(_STATE.get("voice_active", 0), _STATE.get("button_ts", 0),
+               _STATE.get("touch_ts", 0))
+    if last and time.time() - last > 900:
+        bits.append("nobody has played with you in a long while")
+    if not bits:
+        return ""
+    return "(Right now: " + ", ".join(bits) + ".)"
+
+
 def busy() -> bool:
     """True if the human is talking / listening / touching — don't auto-interrupt."""
     now = time.time()
@@ -636,11 +674,14 @@ SHAKE_GYRO = float(os.environ.get("VECTOR_SHAKE_GYRO", "8"))
 # flip/tilt reaction below this (0.85 ~= 32 deg tilt; lower = needs a bigger flip).
 FLIP_TILT = float(os.environ.get("VECTOR_FLIP_TILT", "0.85"))
 EVENT_COOLDOWN = float(os.environ.get("VECTOR_EVENT_COOLDOWN", "6"))
+# Something this close (mm) to his face counts as a hand/toy at his nose.
+NEAR_MM = float(os.environ.get("VECTOR_NEAR_MM", "70"))
 
 
 def reflex_loop():
-    prev_touch = prev_pick = prev_cliff = prev_flipped = False
-    last_event = last_batt = batt_check = last_snap = 0.0
+    prev_touch = prev_pick = prev_cliff = prev_flipped = prev_near = False
+    last_event = last_batt = batt_check = last_snap = touch_start = 0.0
+    prev_prox = None
     shake = 0
     while True:
         time.sleep(0.1)
@@ -653,10 +694,14 @@ def reflex_loop():
             picked = ROBOT.picked_up()
             cliff = ROBOT.cliff()
             az, gmag, pitch, tilt = ROBOT.motion()
+            prox = ROBOT.proximity()
+            moving_now = ROBOT.moving()
         except Exception:
             continue
         if button:
             _STATE["button_ts"] = now
+        if touched:
+            _STATE["touch_ts"] = now
         # Cache a full sensor snapshot (~3s) so the voice path needs no RPC.
         if now - last_snap > 3:
             last_snap = now
@@ -678,6 +723,14 @@ def reflex_loop():
                    (now - _STATE.get("button_ts", 0) < 6)
 
         flipped = tilt < FLIP_TILT
+        upside_down = tilt < 0.15                 # fully inverted vs just on its side
+        near = prox is not None and prox < NEAR_MM
+        docked = bool(_STATE.get("sense", {}).get("on_charger"))
+        if not touched:
+            touch_start = 0.0
+        elif touch_start == 0.0:
+            touch_start = now
+
         event = None
         allow_move = True
         is_petting = False
@@ -686,30 +739,53 @@ def reflex_loop():
             # flip), so touch wins. Level-based (not edge) so continuous petting
             # keeps reacting and a missed rising-edge during cooldown isn't lost.
             if touched and now - last_event > TOUCH_COOLDOWN:
-                event, is_petting = "Your owner is petting your back.", True
+                long_rub = touch_start and now - touch_start > 4
+                event, is_petting = (
+                    "Your owner has been rubbing your back for a while now — pure bliss."
+                    if long_rub else "Your owner is petting your back."), True
             elif not touched and now - last_event > EVENT_COOLDOWN:
                 if flipped and not prev_flipped:        # real flip (not a petting press)
-                    event, allow_move = "You were just tilted or flipped over!", False
+                    event, allow_move = (
+                        "You've been turned completely UPSIDE-DOWN — the world is inverted!"
+                        if upside_down else
+                        "You were just tipped over onto your side!"), False
                 elif picked and not prev_pick:
-                    event, allow_move = "Someone just picked you up off the ground.", False
+                    event, allow_move = (
+                        "Someone scooped you up high and is cradling you in their hands."
+                        if held else "Someone just picked you up off the ground."), False
                 elif prev_pick and not picked:
-                    event = "You were just put back down on a surface."
+                    event = "You were just set back down on a surface."
                 elif shake >= 3:
-                    event, allow_move = "Someone is shaking you.", False
-        prev_touch, prev_pick, prev_flipped = touched, picked, flipped
+                    hard = gmag > SHAKE_GYRO * 2.2
+                    event, allow_move = (
+                        "Someone is shaking you HARD — whoa, everything's a blur!"
+                        if hard else "Someone is gently jiggling you about."), False
+                elif (near and not prev_near and not moving_now and not docked
+                      and now - ROBOT.last_action > 2.5):
+                    fast = (prev_prox is not None and prev_prox - prox > 35)
+                    event, allow_move = (
+                        "A hand just darted right up to your face — almost a boop on the nose!"
+                        if fast else
+                        "Something has drifted right up close, hovering at your face."), False
+        prev_touch, prev_pick, prev_flipped, prev_near = touched, picked, flipped, near
+        prev_prox = prox
 
         if event:
             last_event = now
             shake = 0
+            scene = _scene()                       # combine with ambient context
+            situation = (event + " " + scene).strip() if scene else event
             try:
                 # Grab control IMMEDIATELY to override Vector's native firmware
                 # reaction, hold it through our whole reaction, then release.
                 with ROBOT.control():
                     if is_petting:
                         ROBOT.act("CUDDLE")
+                    elif near and not picked and not flipped:
+                        ROBOT.emote("curious")     # something at his nose -> inquisitive
                     else:
                         ROBOT.emote("surprised")   # instant, interrupts the native anim
-                    react(event, allow_move=allow_move)
+                    react(situation, allow_move=allow_move)
             except Exception as exc:
                 print(f"[reflex] {exc}")
             continue
