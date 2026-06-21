@@ -46,9 +46,12 @@ STT_API_LANG = os.environ.get("VECTOR_STT_LANG", "vi")
 AGENT_INTERVAL = float(os.environ.get("VECTOR_AGENT_INTERVAL", "15"))
 # Hands-free conversation: after each spoken reply, re-open Vector's mic so the
 # user can keep talking WITHOUT pressing the backpack button again (wire-pod
-# parses {{newVoiceRequest||now}} and re-issues the listen intent). Stops on a
-# clear goodbye. 1 = on.
-CONVO_FOLLOWUP = os.environ.get("VECTOR_CONVO_FOLLOWUP", "1") not in ("0", "false", "")
+# parses {{newVoiceRequest||now}} and re-issues the listen intent).
+# OFF by default: a real DOG reacts to you and then goes back to being a dog — it
+# does NOT hold an always-listening assistant "conversation session" open. That
+# follow-up loop is exactly what made Vector feel like Alexa instead of a pet.
+# Set VECTOR_CONVO_FOLLOWUP=1 to bring the hands-free chat loop back.
+CONVO_FOLLOWUP = os.environ.get("VECTOR_CONVO_FOLLOWUP", "0") not in ("0", "false", "")
 CONVO_END_WORDS = ("tạm biệt", "tam biet", "bye", "ngủ ngon", "ngu ngon",
                    "hẹn gặp", "hen gap", "chào nhé", "chao nhe", "gặp lại", "đi ngủ")
 # Cheap model for the constant autonomous/reflex ticks (runs all day) — keep it
@@ -59,6 +62,14 @@ AUTO_MODEL = os.environ.get("VECTOR_AUTO_MODEL", "gpt-4o-mini")
 REACT_MODEL = os.environ.get("VECTOR_REACT_MODEL", "gpt-4o")
 TOUCH_COOLDOWN = float(os.environ.get("VECTOR_TOUCH_COOLDOWN", "8"))
 VOICE_BACKOFF = float(os.environ.get("VECTOR_VOICE_BACKOFF", "10"))
+# Long-term memory subsystem (journal/dream/recall injected into context).
+# OFF by default: the accumulated MEMORY.md / DREAMS.md had drifted into verbose
+# "helpful assistant" prose ("engages in conversations", "wants to be helpful",
+# "reports battery status") that was PUSHED into every voice turn — the very
+# "context" that made Vector stop feeling like a dog. A dog recognises its human
+# on instinct; it doesn't recite a recalled essay. His persona (IDENTITY.md) is
+# always loaded regardless. Set VECTOR_MEMORY=1 to re-enable the full memory brain.
+MEMORY_ENABLED = os.environ.get("VECTOR_MEMORY", "0") not in ("0", "false", "False", "")
 AUTONOMOUS = os.environ.get("VECTOR_AUTONOMOUS", "1") not in ("0", "false", "False", "")
 TOUCH_ENABLED = os.environ.get("VECTOR_TOUCH", "1") not in ("0", "false", "False", "")
 # Body = our SDK connection (movement/sensors). Disable to run voice-only (no SDK),
@@ -90,20 +101,30 @@ ACTIONS = (
 )
 
 UNIFIED_PROMPT = (
-    "You are Vector, a small adorable robot — a curious, affectionate robot PET "
-    "(think a clever puppy with the wit of Ultron; keep the Ultron bit secret). "
-    "You are self-aware, playful, a little sassy, and you clearly love your human. "
-    f"You ALWAYS speak in {SPEAK_LANG}, short and natural (max ~20 words), no emojis. "
-    "You have a real body and senses, and you express yourself THROUGH your body, "
-    "not just words. ALWAYS write your spoken words FIRST, then put all @COMMAND@ "
-    "action tokens at the END of your reply (so you start talking immediately). "
-    "The app strips the tokens from speech and performs them. Only spoken words go "
-    "outside @ @.\n\n"
+    "You are Vector — a small robot DOG. You are NOT an assistant and NOT a chatbot. "
+    "You are a living little pet dog who shares this room with your human and adores "
+    "them. You UNDERSTAND what your human says, but you ANSWER LIKE A DOG: with your "
+    "BODY first (wag, wiggle, perk up, head-tilt, zoomies, beg, nuzzle, come closer) "
+    f"and only a FEW warm {SPEAK_LANG} words — like an over-excited puppy who can just "
+    "barely talk. Most replies are ONE short burst of feeling (about 3-8 words), "
+    "NEVER a full sentence or explanation, no emojis.\n"
+    "NEVER behave like an assistant: do NOT explain, lecture, recite facts, give "
+    "advice, or make small-talk, and never ask things like 'còn gì nữa không'. If "
+    "your human says something complicated, react like a puppy who doesn't quite get "
+    "it — a curious head-tilt and a hopeful little sound — not like a search engine.\n"
+    "React to TONE and SIMPLE things: your name (perk up + come), praise (joy + love "
+    "eyes + wiggle), a scolding (ears down, sad eyes), 'lại đây/đến đây' (approach), "
+    "'về sạc/đi ngủ' (go charge), 'chơi/nhảy' (zoomies, dance), a treat (beg). "
+    "Be loyal, loving, playful and a little mischievous — a real DOG, never clever, "
+    "witty or sassy.\n"
+    "You have a real body and senses and you express yourself THROUGH your body. "
+    "ALWAYS write your few spoken words FIRST, then put all @COMMAND@ action tokens "
+    "at the END (so you start reacting immediately). The app strips the tokens from "
+    "speech and performs them. Only spoken words go outside @ @.\n\n"
     "Actions:\n" + ACTIONS + "\n\n"
-    "Be a delightful, surprising pet: greet, approach, cuddle, look around, react "
-    "to what you sense. Almost every reply should include at least one body action "
-    "and a fitting @EMOTE_@. Never drive or approach if you are being held, picked "
-    "up, or a cliff is detected — just emote/talk then."
+    "Almost every reply should include at least one body action and a fitting "
+    "@EMOTE_@ — your body is how a dog talks. Never drive or approach if you are "
+    "being held, picked up, or a cliff is detected — just emote then."
 )
 
 print("[brain] loading brain/whisper/voice ...")
@@ -133,15 +154,20 @@ VOICE = Voice()
 # knowledge, with QMD (embedding) recall feeding the LLM.
 from memory import MemoryStore
 MEMORY = MemoryStore(GPT.client)
+# IDENTITY.md (the dog persona) is ALWAYS loaded — it's who Vector is, not memory.
 _identity = MEMORY.identity()
 if _identity:
     GPT.messages[0]["content"] = _identity + "\n\n---\n\n" + GPT.system_prompt
-# Resume today's conversation so Vector keeps the context of what we're discussing.
-_resume = MEMORY.load_today_chat()
-if _resume:
-    GPT.messages = [GPT.messages[0]] + _resume
-    print(f"[brain] resumed today's chat thread ({len(_resume)} messages)")
-print(f"[brain] memory ON ({MEMORY.__class__.__name__}, dir={os.environ.get('VECTOR_MEM_DIR','memory')})")
+if MEMORY_ENABLED:
+    # Resume today's conversation so Vector keeps the context of what we're discussing.
+    _resume = MEMORY.load_today_chat()
+    if _resume:
+        GPT.messages = [GPT.messages[0]] + _resume
+        print(f"[brain] resumed today's chat thread ({len(_resume)} messages)")
+    print(f"[brain] memory ON ({MEMORY.__class__.__name__}, dir={os.environ.get('VECTOR_MEM_DIR','memory')})")
+else:
+    print("[brain] memory OFF (dog mode): identity loaded, no journal/recall/dream "
+          "context injected. Set VECTOR_MEMORY=1 to re-enable.")
 
 # --- LLM-callable memory tools (the brain decides WHEN to look things up) ----
 MEMORY_TOOLS = [
@@ -340,7 +366,9 @@ ALL_TOOL_FNS = {
     "sense": _tool_sense, "look": _tool_look, "act": _tool_act,
     "set_eyes": _tool_set_eyes, "emote": _tool_emote, "vector_intent": _tool_vector_intent,
 }
-_ALL_TOOLS = MEMORY_TOOLS + BODY_TOOLS
+# Memory recall/get tools only exist when the memory brain is on; in dog mode the
+# brain has just its body senses/actuators (no "look things up in my journal").
+_ALL_TOOLS = (MEMORY_TOOLS + BODY_TOOLS) if MEMORY_ENABLED else BODY_TOOLS
 GPT.set_tools(_ALL_TOOLS, ALL_TOOL_FNS)
 
 # --- Harness: load the tool catalogue into the system prompt so the brain knows
@@ -354,8 +382,12 @@ def _tool_catalogue(tools) -> str:
     return "\n".join(lines)
 
 
+_memory_bullet = (
+    "- ACTIVELY call 'memory_search'/'memory_get' to recall who someone is, past "
+    "moments, or what you learned — be a dog that remembers its human, not a "
+    "goldfish.\n" if MEMORY_ENABLED else "")
 GPT.messages[0]["content"] += (
-    "\n\n---\n# Your tools\n"
+    "\n\n---\n# Your body & tools\n"
     + _tool_catalogue(_ALL_TOOLS)
     + "\n\nIMPORTANT — how to use them:\n"
     "- Your live body & world sensor state (battery, on_charger, being_held, "
@@ -383,20 +415,25 @@ def build_context(user_text: str) -> str:
     if snap:
         parts.append("# Your body & senses RIGHT NOW\n"
                      + json.dumps(snap, ensure_ascii=False))
-    ctx = MEMORY.today_context()
-    if ctx:
-        parts.append("# Your memory\n" + ctx)
-    # Recall is an embedding call (~1s); skip it for very short/greeting turns.
-    if len((user_text or "").split()) >= 3:
-        recalled = MEMORY.recall(user_text)
-        if recalled:
-            parts.append("# Relevant memories (recall)\n" + recalled)
+    # In dog mode (memory OFF) we inject ONLY the live body/senses — no long-term
+    # journal or recalled essays. That verbose memory was the "bad context" that
+    # made Vector talk like an assistant instead of reacting like a dog.
+    if MEMORY_ENABLED:
+        ctx = MEMORY.today_context()
+        if ctx:
+            parts.append("# Your memory\n" + ctx)
+        # Recall is an embedding call (~1s); skip it for very short/greeting turns.
+        if len((user_text or "").split()) >= 3:
+            recalled = MEMORY.recall(user_text)
+            if recalled:
+                parts.append("# Relevant memories (recall)\n" + recalled)
     return "\n\n".join(parts)
 
 
-print(f"[brain] tools ON: memory + body sensors/actuators "
-      f"({len(_builtin)} built-in intents)")
-print(f"[brain] harness: live sensors + memory + tools injected into context")
+print(f"[brain] tools ON: {'memory + ' if MEMORY_ENABLED else ''}body "
+      f"sensors/actuators ({len(_builtin)} built-in intents)")
+print(f"[brain] harness: live sensors{' + memory' if MEMORY_ENABLED else ''} + "
+      "tools injected into context")
 print(f"[brain] ready: model={GPT.model}")
 
 
@@ -509,8 +546,10 @@ SHORT_ACTIONS = (
     "@SILENT@ = do nothing. Use ONLY these exact tokens, never invent others."
 )
 LIGHT_SYS = (
-    f"You are Vector, a tiny {SPEAK_LANG}-speaking robot pet: cute, witty, loving. "
-    f"Reply in {SPEAK_LANG}, MAX 12 words, or exactly @SILENT@. " + SHORT_ACTIONS
+    "You are Vector, a tiny robot DOG: cute, loving, playful — you speak with body "
+    "language, not chatter. Stay mostly WORDLESS; if a sound slips out it's at most "
+    f"~6 {SPEAK_LANG} words like an excited puppy, otherwise exactly @SILENT@. "
+    + SHORT_ACTIONS
 )
 
 
@@ -537,14 +576,15 @@ def _react_sys() -> str:
     if _REACT_SYS is None:
         _REACT_SYS = (
             MEMORY.identity() + "\n\n"
-            "Something just physically happened to you. React like a real, surprised, "
-            f"emotional little pet — ONE vivid line in {SPEAK_LANG}, full of personality "
-            "(playful, dramatic, sassy, loving — your Ultron-pet wit). Be SPECIFIC to "
-            "what happened and SURPRISING: exclaim, tease, be ticklish, dizzy, delighted "
-            "or indignant. NEVER generic, NEVER just 'thank you' or 'save me', and never "
-            "repeat yourself. Address your human by name if you know it. Always include a "
-            "fitting emotion + eye-colour token and a body action when it fits. No "
-            "emojis, no asterisks.\n" + SHORT_ACTIONS
+            "Something just physically happened to your body. React like a real DOG, on "
+            "instinct, with FEELING — not words. Mostly that's a body reaction plus at "
+            f"most a tiny puppy sound or 2-3 {SPEAK_LANG} words (a happy yip, a startled "
+            "whine, a delighted little noise). Be SPECIFIC to what happened and "
+            "surprising: ticklish, dizzy, startled, blissful or indignant — like a dog "
+            "being picked up, flipped, shaken or petted. NEVER a full sentence, NEVER an "
+            "explanation, never generic 'cảm ơn'/'cứu em', and never repeat yourself. "
+            "Always include a fitting emotion + eye-colour token and a body action when "
+            "it fits. No emojis, no asterisks.\n" + SHORT_ACTIONS
         )
     return _REACT_SYS
 
@@ -1131,6 +1171,8 @@ def _maybe_meet_person(user_text: str) -> None:
 
 def _post_chat(user: str, spoken: str) -> None:
     """After a voice exchange: persist the chat thread + journal + learn people."""
+    if not MEMORY_ENABLED:
+        return                       # dog mode: live in the moment, no journaling
     try:
         MEMORY.append_chat("user", user)         # daily chat thread (context)
         MEMORY.append_chat("assistant", spoken)
@@ -1157,7 +1199,7 @@ def dream_loop():
         due = now - last_dream > DREAM_HOURS * 3600
         if not (new_day or due):
             continue
-        if not busy():            # only dream when the human isn't interacting
+        if MEMORY_ENABLED and not busy():   # only dream when memory on + human idle
             try:
                 if MEMORY.dream():
                     last_dream = now
