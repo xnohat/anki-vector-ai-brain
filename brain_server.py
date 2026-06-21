@@ -1075,6 +1075,7 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(f"data: {json.dumps(ch)}\n\n".encode()); self.wfile.flush()
 
         stripper = _TokenStripper()
+        spoken_sent = ""
         try:
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
@@ -1085,10 +1086,19 @@ class Handler(BaseHTTPRequestHandler):
                 for delta in GPT.stream_answer(user, image=frame, memories=ctx):
                     words = stripper.feed(delta)
                     if words:
+                        spoken_sent += words
                         send({"content": words})
             tail = stripper.flush()
             if tail:
+                spoken_sent += tail
                 send({"content": tail})
+            # CRITICAL: wire-pod's KG only registers a reply that contains a
+            # sentence-ending mark (kgsim.go splits the stream on . ? ! ...). The
+            # dog's ultra-short lines ("Đợi anh nè", "Gâu hihi") often have NONE,
+            # so wire-pod sees an empty slice -> "LLM returned no response" ("không
+            # kết nối được LLM"). Guarantee a terminal mark so it always registers.
+            if spoken_sent.strip() and spoken_sent.rstrip()[-1] not in ".!?…":
+                send({"content": "!"})
             # Hands-free: re-open the mic for a follow-up so the user keeps talking
             # without the button. wire-pod parses {{newVoiceRequest||now}} (even
             # with commands off) -> re-issues the listen intent. Skip on goodbye.

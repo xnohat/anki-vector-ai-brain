@@ -255,8 +255,13 @@ class CustomGPT:
             for _ in range(5):       # agentic loop: resolve tools, then stream words
                 kwargs = dict(model=self.model, temperature=1.0,
                               messages=call_messages, stream=True)
-                if self.tools:
-                    kwargs["tools"] = self.tools
+                # NOTE: deliberately do NOT offer function-tools on the VOICE stream.
+                # wire-pod reads this SSE and speaks it; if the model spends the first
+                # round on tool_calls (no content), wire-pod sees an empty stream and
+                # reports "LLM returned no response" ("không kết nối được LLM"). The
+                # dog expresses body actions via @COMMAND@ tokens IN the spoken text
+                # (parsed + run by brain_server _deferred_act), so it never needs
+                # function-tools here — and it always streams its words immediately.
                 content = ""
                 tool_acc = {}        # index -> {id, name, args}
                 for chunk in self.client.chat.completions.create(**kwargs):
