@@ -135,7 +135,11 @@ if BODY_ENABLED:
     # thread connects + reconnects it in the background when the robot is awake.
     try:
         print("[brain] connecting SDK body (movement/sensors) ...")
-        ROBOT = SmartVector()
+        # ONE fast attempt only: never block brain startup on a sleeping/unreachable
+        # robot. If it fails, body_manager reconnects in the background (full retry
+        # budget) the moment Vector wakes. This keeps the brain ALIVE and serving
+        # 24/7 so it's always ready to control Vector.
+        ROBOT = SmartVector(retries=1)
     except Exception as exc:
         print(f"[brain] body not ready ({exc}); brain runs voice-only, will keep retrying")
         ROBOT = None

@@ -127,13 +127,49 @@ if [ "$1" == "--no-pod" ]; then
     wait "$BRAIN_PID"; exit 0
 fi
 
-echo "=== [3/4] Starting wire-pod Brain bridge (needs sudo for port 443) ==="
-cd "$CHIPPER"
+echo "=== [3/4] Starting wire-pod Brain bridge in the BACKGROUND (best-effort) ==="
+# IMPORTANT: wire-pod is ONLY Vector's VOICE bridge (mic/STT/TTS on port 443). The
+# BRAIN (port 7070 + the SDK body) is what actually controls Vector and MUST stay
+# alive 24/7. So we no longer `exec` wire-pod as the service's main process — if
+# wire-pod can't start (e.g. port 443 already taken by tailscale), it must NOT drag
+# the brain down with it (that caused a restart crash-loop). The BRAIN is the
+# resilient main process; wire-pod is best-effort and logged separately.
+VECTOR_SERIAL="${VECTOR_SERIAL:-00907f6b}"
+# Bind chipper's :443 to the Pi's CURRENT LAN IP so it coexists with tailscale
+# Funnel holding <tailnet-ip>:443 (0.0.0.0:443 would collide). Vector reaches
+# wire-pod via escapepod.local -> the Pi's LAN IP, so the bind must TRACK that IP.
+lan_ip() { ip route get 1.1.1.1 2>/dev/null | grep -oP 'src \K\S+'; }
+
+# wire-pod MANAGER (self-healing, background): keeps chipper running, bound to the
+# Pi's current LAN IP, and AUTO RE-BINDS if that DHCP IP later changes (it does not
+# hardcode an IP — it re-detects and restarts wire-pod on change). Also relaunches
+# chipper if it dies. The BRAIN stays the resilient main process throughout.
+: > /tmp/wire-pod.log
+(
+  cur=""
+  while true; do
+    now="$(lan_ip)"
+    if { [ -n "$now" ] && [ "$now" != "$cur" ]; } || ! pgrep -x chipper >/dev/null 2>&1; then
+      if [ -n "$cur" ] && [ -n "$now" ] && [ "$now" != "$cur" ]; then
+        echo "    [lan] Pi LAN IP changed $cur -> $now; re-binding wire-pod to ${now}:443" \
+          | tee -a /tmp/wire-pod.log
+      fi
+      sudo pkill -15 -x chipper 2>/dev/null || true
+      sleep 2
+      cur="$now"
+      ( cd "$CHIPPER" && exec sudo -E WIREPOD_HOST="$cur" STT_SERVICE=brain \
+          BRAIN_STT_URL="http://127.0.0.1:$BRAIN_PORT/stt" ./start.sh ) >>/tmp/wire-pod.log 2>&1 &
+      echo "    wire-pod (re)started, bound ${cur:-0.0.0.0}:443 (log: /tmp/wire-pod.log)"
+    fi
+    sleep 30
+  done
+) &
+WIREPOD_MGR_PID=$!
+echo "    wire-pod manager pid $WIREPOD_MGR_PID (auto re-binds on LAN-IP change)"
 
 # Re-apply the backpack-button -> "Hey Vector" voice-listening setting. A robot
 # REBOOT resets button_wakeword to default, after which pressing the button no
 # longer triggers STT. Re-apply it once wire-pod is up + connected to the robot.
-VECTOR_SERIAL="${VECTOR_SERIAL:-00907f6b}"
 (
   for i in $(seq 1 30); do
     if curl -sf --max-time 5 "http://localhost:8080/api-sdk/button_hey_vector?serial=$VECTOR_SERIAL" 2>/dev/null | grep -q done; then
@@ -144,5 +180,16 @@ VECTOR_SERIAL="${VECTOR_SERIAL:-00907f6b}"
   done
 ) &
 
-echo "=== [4/4] Say 'Hey Vector' / press the backpack button and speak. ==="
-exec sudo -E STT_SERVICE=brain BRAIN_STT_URL="http://127.0.0.1:$BRAIN_PORT/stt" ./start.sh
+# Tie the SERVICE's life to the BRAIN only: clean up both children on stop; if the
+# brain dies, exit (systemd Restart=on-failure brings it back); if wire-pod dies,
+# the brain keeps running so Vector is never left without his controller.
+cleanup() {
+  kill "$WIREPOD_MGR_PID" 2>/dev/null || true   # stop the manager FIRST, else it re-launches chipper
+  kill -15 "$BRAIN_PID" 2>/dev/null || true
+  sudo pkill -15 -x chipper 2>/dev/null || true
+  sudo pkill -15 -f "chipper/start.sh" 2>/dev/null || true
+}
+trap cleanup INT TERM EXIT
+
+echo "=== [4/4] Brain is the resilient main process. Press the backpack button and speak. ==="
+wait "$BRAIN_PID"; exit $?

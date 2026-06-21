@@ -155,7 +155,7 @@ EYE = {
 
 
 class SmartVector:
-    def __init__(self) -> None:
+    def __init__(self, retries: int = 3, retry_delay: float = 6.0) -> None:
         # Self-heal a DHCP IP change before connecting: if his configured IP went
         # stale, find him on the LAN by his pinned cert and rewrite the config.
         try:
@@ -165,9 +165,12 @@ class SmartVector:
         args = anki_vector.util.parse_command_args()
         # Connect with retries: a previous (killed) process can leave stale
         # behaviour control on the robot for up to ~60s, which makes connect time
-        # out. Retry until the robot frees control.
+        # out. Retry until the robot frees control. Pass retries=1 for a fast,
+        # NON-BLOCKING attempt at brain startup (so the HTTP server / brain comes
+        # up in ~2s even when Vector is asleep) — body_manager then reconnects in
+        # the background with the full retry budget.
         last_exc = None
-        for attempt in range(3):
+        for attempt in range(max(1, retries)):
             self.robot = anki_vector.AsyncRobot(
                 args.serial,
                 behavior_control_level=ControlPriorityLevel.OVERRIDE_BEHAVIORS_PRIORITY,
@@ -179,7 +182,7 @@ class SmartVector:
                 break
             except Exception as exc:
                 last_exc = exc
-                print(f"[smart] connect attempt {attempt + 1}/3 failed: {exc}")
+                print(f"[smart] connect attempt {attempt + 1}/{max(1, retries)} failed: {exc}")
                 # MUST fully close the half-open channel or its socket leaks. A
                 # failed connect already created the gRPC channel (control request
                 # is the LAST step), and Robot.disconnect() closes the socket only
@@ -187,7 +190,8 @@ class SmartVector:
                 # socket is orphaned. Leaked sockets pile up and saturate Vector
                 # until nothing can get control ("Failed to get control" forever).
                 _force_close(self.robot)
-                time.sleep(6)
+                if attempt + 1 < max(1, retries):   # don't sleep after the last try
+                    time.sleep(retry_delay)
         if last_exc is not None:
             raise last_exc
 
