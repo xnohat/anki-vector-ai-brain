@@ -35,7 +35,62 @@ from whisperstt import WhisperSTT
 from voice import Voice
 from smart import SmartVector
 
-HOST = os.environ.get("BRAIN_HOST", "127.0.0.1")
+import collections
+from urllib.parse import urlparse, parse_qs
+
+
+class _DashTee:
+    """Tee everything the brain prints into an in-memory ring buffer so the live
+    web dashboard can stream it (heard / replied / reacted / tools), while still
+    writing through to the real stdout (the log file)."""
+    def __init__(self, real, maxlen=1500):
+        self.real = real
+        self.buf = collections.deque(maxlen=maxlen)
+        self.seq = 0
+        self._lock = threading.Lock()
+        self._partial = ""
+
+    def write(self, s):
+        try:
+            self.real.write(s)
+        except Exception:
+            pass
+        with self._lock:
+            self._partial += s
+            while "\n" in self._partial:
+                line, self._partial = self._partial.split("\n", 1)
+                line = line.rstrip()
+                if line:
+                    self.seq += 1
+                    self.buf.append((self.seq, time.time(), line))
+
+    def flush(self):
+        try:
+            self.real.flush()
+        except Exception:
+            pass
+
+    def since(self, seq):
+        with self._lock:
+            return self.seq, [{"seq": s, "t": t, "line": l}
+                              for (s, t, l) in self.buf if s > seq]
+
+    def latest(self, *prefixes):
+        with self._lock:
+            for (s, t, l) in reversed(self.buf):
+                if l.startswith(prefixes):
+                    return {"t": t, "line": l}
+        return None
+
+
+DASH = _DashTee(sys.stdout)
+sys.stdout = DASH
+BOOT = time.time()
+
+# Bind on all interfaces by default so the monitor dashboard is reachable from the
+# LAN (e.g. http://<pi-ip>:7070/dashboard); wire-pod still reaches /stt+/v1 on
+# 127.0.0.1. Set BRAIN_HOST=127.0.0.1 to keep it local-only.
+HOST = os.environ.get("BRAIN_HOST", "0.0.0.0")
 PORT = int(os.environ.get("BRAIN_PORT", "7070"))
 SPEAK_LANG = os.environ.get("VECTOR_LANG", "Vietnamese")
 # STT backend: "openai" (fast cloud, ~1-2s, best for the robot's voice timeout) or
@@ -399,13 +454,13 @@ GPT.messages[0]["content"] += (
     "in the context below. It is PUSHED to you — do NOT waste a call on 'sense'.\n"
     "- Only your eyes and ears cost extra, so PULL them on demand: call 'look' to "
     "actually SEE through your camera when it matters.\n"
-    "- ACTIVELY call 'memory_search'/'memory_get' to recall who someone is, past "
-    "moments, or what you learned — be a robot with real memory, not a goldfish.\n"
-    "- Use 'act'/'set_eyes'/'emote'/'vector_intent' to move your body when it adds "
-    "to the moment (low battery -> act(return_to_charger); hear music / very happy "
+    + _memory_bullet +
+    "- Use 'act'/'set_eyes'/'emote'/'vector_intent' to move your body — that IS how "
+    "a dog talks (low battery -> act(return_to_charger); hear music / very happy "
     "-> act(dance)).\n"
-    "Tool calls are silent; only the words in your reply are spoken. When nothing "
-    "needs doing, a short reply (or none) is fine — let your natural behaviours be."
+    "Tool calls are silent; only the words in your reply are spoken. A dog rarely "
+    "needs words at all — a short happy sound or none, plus body language, is "
+    "perfect. Let your natural behaviours be."
 )
 
 
@@ -457,6 +512,11 @@ def transcribe(wav_path: str) -> str:
 
 _TOKEN_RE = re.compile(r"@.*?@")
 _BRAIN_LOCK = threading.Lock()          # serialize GPT calls across threads
+# Set while a reflex reaction (control + LLM + TTS playback, ~15s) is running in
+# its OWN thread. The reflex loop checks this so it (a) never stacks reactions and
+# (b) skips the battery RPC while the SDK is busy with a reaction — the loop itself
+# keeps polling cached sensors so the live snapshot never freezes.
+_REACTING = threading.Event()
 _STATE = {"voice_active": 0.0, "button_ts": 0.0, "touch_ts": 0.0,
           "sense": {}, "sense_ts": 0.0}
 VISION_WORDS = ("thấy", "nhìn", "xem", "see", "look", "đọc", "màu", "ai ", "gì",
@@ -771,15 +831,24 @@ def greet_owner(snap: dict) -> None:
           "line.", allow_move=True)
 
 
+# How active the autonomous DOG is. When his human is in sight he spontaneously
+# does little dog things fairly often (so you actually SEE a living pet); when
+# he's alone he mostly rests/sleeps and lets his native firmware freeplay be him,
+# doing only an occasional silent body-thing. Tune via env.
+DOG_ACTIVE_EVERY = float(os.environ.get("VECTOR_DOG_ACTIVE_EVERY", "30"))
+DOG_ALONE_EVERY = float(os.environ.get("VECTOR_DOG_ALONE_EVERY", "240"))
+
+
 def autonomous_loop():
-    """Smart, mostly-IDLE agent. The world sensor state is PUSHED into context
-    continuously (reflex loop, ~3s), so the agent already knows it without any
-    tool call. Here Vector mostly RESTS so his native firmware freeplay (the
-    built-in funny behaviours) runs uninterrupted — he only steps in for
-    something that genuinely matters, using memory + context to be smart, not
-    chatty. Camera (eyes) and mic (ears) are touched ONLY on demand via tools."""
+    """A living little DOG. The world sensor state is PUSHED into context every
+    ~3s (reflex loop), so this loop already knows it with no RPC. When his human
+    is around, Vector spontaneously does dog things (head-tilt, wag, zoomies, beg,
+    perk up, come nuzzle) so he visibly behaves like a pet — not a statue waiting
+    to be spoken to. When he's ALONE he mostly rests (lets native freeplay run)
+    and only now and then does one quiet, wordless body-thing."""
     prev_faces = 0
     last_greet = 0.0
+    last_dog = 0.0
     while True:
         time.sleep(AGENT_INTERVAL)
         if not AUTONOMOUS or ROBOT is None or busy():
@@ -789,12 +858,35 @@ def autonomous_loop():
         on_charger = snap.get("on_charger")
         now = time.time()
         try:
-            # Owner just reappeared after being away -> one heartfelt greeting.
-            # Otherwise do NOTHING: don't grab control, don't talk -> let his
-            # native freeplay behaviours be Vector.
-            if faces > 0 and prev_faces == 0 and not on_charger and now - last_greet > 300:
-                last_greet = now
-                greet_owner(snap)
+            # Share the _REACTING gate with the reflex loop so an autonomous move
+            # and a sensor reaction never grab body control at the same time.
+            if not _REACTING.is_set():
+                # 1) Owner just reappeared after being away -> heartfelt greeting.
+                if faces > 0 and prev_faces == 0 and not on_charger and now - last_greet > 300:
+                    last_greet = now
+                    last_dog = now
+                    _REACTING.set()
+                    try:
+                        greet_owner(snap)
+                    finally:
+                        _REACTING.clear()
+                # 2) Human in sight -> spontaneous dog things, so he feels alive.
+                elif faces > 0 and now - last_dog > DOG_ACTIVE_EVERY:
+                    last_dog = now
+                    _REACTING.set()
+                    try:
+                        dog_tick(faces, on_charger)
+                    finally:
+                        _REACTING.clear()
+                # 3) Alone -> mostly rest; just an occasional quiet body-thing so
+                #    native freeplay still gets to be Vector most of the time.
+                elif faces == 0 and now - last_dog > DOG_ALONE_EVERY:
+                    last_dog = now
+                    _REACTING.set()
+                    try:
+                        dog_tick(faces, on_charger)
+                    finally:
+                        _REACTING.clear()
         except Exception as exc:
             print(f"[auto] tick failed: {exc}")
         prev_faces = faces
@@ -812,13 +904,59 @@ FLIP_TILT = float(os.environ.get("VECTOR_FLIP_TILT", "0.6"))
 FLIP_SUSTAIN = float(os.environ.get("VECTOR_FLIP_SUSTAIN", "1.0"))
 EVENT_COOLDOWN = float(os.environ.get("VECTOR_EVENT_COOLDOWN", "6"))
 # Something this close (mm) to his face counts as a hand/toy at his nose.
-NEAR_MM = float(os.environ.get("VECTOR_NEAR_MM", "70"))
+NEAR_MM = float(os.environ.get("VECTOR_NEAR_MM", "55"))
+# Proximity "boop at the nose" reflex. ON, but with HYSTERESIS so it isn't twitchy:
+# it fires only when something comes near AFTER Vector has seen clear open space
+# (proximity > NEAR_REARM_MM), then it won't fire again until the object/hand goes
+# away again. So a wall/toy sitting ~3-7cm from his face, or sensor noise flickering
+# across the threshold, no longer machine-guns the reaction (the old "ting ting
+# scanning" racket). Set VECTOR_PROXIMITY_REFLEX=0 to disable entirely.
+PROXIMITY_REFLEX = os.environ.get("VECTOR_PROXIMITY_REFLEX", "1") not in ("0", "false", "False", "")
+# Must see clear space past this (mm) before the boop can re-arm.
+NEAR_REARM_MM = float(os.environ.get("VECTOR_NEAR_REARM_MM", "140"))
+
+
+def _run_reaction(situation, is_petting, near, picked, flipped, allow_move):
+    """Run one sensor reaction (grab control -> instant emote -> LLM line + TTS) in
+    its OWN thread, so it NEVER blocks the reflex loop. The loop keeps polling
+    sensors at 10Hz throughout, so the live snapshot stays fresh (this is the fix
+    for 'object_ahead / proximity stuck for a minute'). `_REACTING` is cleared when
+    done so the next reaction can fire."""
+    try:
+        with ROBOT.control():
+            if is_petting:
+                ROBOT.act("CUDDLE")
+            elif near and not picked and not flipped:
+                ROBOT.emote("curious")     # something at his nose -> inquisitive
+            else:
+                ROBOT.emote("surprised")   # instant, interrupts the native anim
+            react(situation, allow_move=allow_move)
+    except Exception as exc:
+        print(f"[reflex] {exc}")
+    finally:
+        _REACTING.clear()
+        _STATE["body_ts"] = time.time()
+
+
+def _battery_low():
+    """Low-battery: cutely yell for help, then crawl back to the charger. Runs in
+    its own thread (gated by _REACTING) so it doesn't block the reflex loop."""
+    try:
+        react("Your battery is almost empty! Cutely yell for help.")
+        ROBOT.return_to_charger()
+    except Exception as exc:
+        print(f"[reflex] battery: {exc}")
+    finally:
+        _REACTING.clear()
+        _STATE["body_ts"] = time.time()
 
 
 def reflex_loop():
     prev_touch = prev_pick = prev_cliff = prev_flipped = prev_near = False
-    last_event = last_batt = batt_check = last_snap = touch_start = 0.0
+    last_event = last_batt = batt_check = touch_start = 0.0
+    _batt_cache = {}              # battery/charging/on_charger (RPC every ~8s)
     flip_latched = False          # fire the flip reaction ONCE, not on a loop
+    near_latched = False          # boop ONCE per approach; re-arm only after clear space
     upright_since = 0.0           # re-arm only after he's been clearly upright a moment
     flip_since = 0.0              # how long he's been continuously tilted (sustain)
     prev_prox = None
@@ -846,16 +984,15 @@ def reflex_loop():
             _STATE["button_ts"] = now
         if touched:
             _STATE["touch_ts"] = now
-        # Cache a full sensor snapshot (~3s) so the voice path needs no RPC.
-        # The freshness of this snapshot is ALSO the body's liveness heartbeat
-        # (body_manager watches sense_ts) — so it needs no competing battery RPC.
-        if now - last_snap > 3:
-            last_snap = now
-            try:
-                _STATE["sense"] = ROBOT.sense()
-                _STATE["sense_ts"] = now
-            except Exception:
-                pass
+        # LIVE snapshot, rebuilt EVERY iteration from RPC-free cached reads merged
+        # with the periodically-refreshed battery — so proximity/object_ahead/touch
+        # never freeze, even while a reaction runs in its own thread. (sense_ts is
+        # also the body's liveness heartbeat that body_manager watches.)
+        try:
+            _STATE["sense"] = {**_batt_cache, **ROBOT.fast_sense()}
+            _STATE["sense_ts"] = now
+        except Exception:
+            pass
 
         # ---- SAFETY (instant, no LLM): table edge -> stop the wheels NOW ----
         if cliff and not prev_cliff:
@@ -890,6 +1027,10 @@ def reflex_loop():
         if upright_since and now - upright_since > 1.5:
             flip_latched = False
         near = prox is not None and prox < NEAR_MM
+        # Hysteresis: re-arm the boop only once Vector has seen clear space again,
+        # so a static object / threshold jitter can't re-fire it.
+        if prox is not None and prox > NEAR_REARM_MM:
+            near_latched = False
         docked = bool(_STATE.get("sense", {}).get("on_charger"))
         if not touched:
             touch_start = 0.0
@@ -927,8 +1068,9 @@ def reflex_loop():
                     event, allow_move = (
                         "Someone is shaking you HARD — whoa, everything's a blur!"
                         if hard else "Someone is gently jiggling you about."), False
-                elif (near and not prev_near and not moving_now and not docked
-                      and now - ROBOT.last_action > 2.5):
+                elif (PROXIMITY_REFLEX and near and not near_latched and not moving_now
+                      and not docked and now - ROBOT.last_action > 2.5):
+                    near_latched = True          # boop once; re-arms after clear space
                     fast = (prev_prox is not None and prev_prox - prox > 35)
                     event, allow_move = (
                         "A hand just darted right up to your face — almost a boop on the nose!"
@@ -940,43 +1082,220 @@ def reflex_loop():
         if event:
             last_event = now
             shake = 0
-            scene = _scene()                       # combine with ambient context
-            situation = (event + " " + scene).strip() if scene else event
-            try:
-                # Grab control IMMEDIATELY to override Vector's native firmware
-                # reaction, hold it through our whole reaction, then release.
-                with ROBOT.control():
-                    if is_petting:
-                        ROBOT.act("CUDDLE")
-                    elif near and not picked and not flipped:
-                        ROBOT.emote("curious")     # something at his nose -> inquisitive
-                    else:
-                        ROBOT.emote("surprised")   # instant, interrupts the native anim
-                    react(situation, allow_move=allow_move)
-            except Exception as exc:
-                print(f"[reflex] {exc}")
-            # A reaction blocks this loop for ~15s (LLM + TTS playback); refresh
-            # the heartbeat so body_manager doesn't mistake that for a dead link
-            # and reconnect (which would re-trigger reflexes in a loop).
-            _STATE["body_ts"] = time.time()
-            continue
+            # Run the reaction in its OWN thread (control + emote + LLM + TTS) so the
+            # loop keeps polling sensors and the snapshot stays live. Never stack
+            # reactions — one at a time.
+            if not _REACTING.is_set():
+                _REACTING.set()
+                scene = _scene()                   # combine with ambient context
+                situation = (event + " " + scene).strip() if scene else event
+                threading.Thread(
+                    target=_run_reaction,
+                    args=(situation, is_petting, near, picked, flipped, allow_move),
+                    daemon=True).start()
 
-        # ---- battery low -> yell for help + crawl back to the charger ----
-        if now - batt_check > 8:
+        # ---- battery: refresh the cached level (+ low -> yell for help & dock) ----
+        # Skip the battery RPC while a reaction owns the SDK (avoid a competing RPC
+        # on the single connection); the cached snapshot keeps the fast fields live.
+        if now - batt_check > 8 and not _REACTING.is_set():
             batt_check = now
-            level, charging, on_charger = ROBOT.battery()
-            if (level is not None and level <= 1 and not charging and not on_charger
-                    and not suppress and now - last_batt > 120):
-                last_batt = now
-                try:
-                    react("Your battery is almost empty! Cutely yell for help.")
-                    ROBOT.return_to_charger()
-                except Exception as exc:
-                    print(f"[reflex] battery: {exc}")
+            try:
+                level, charging, on_charger = ROBOT.battery()
+                if level is not None:
+                    _batt_cache = {"battery_level": level, "charging": bool(charging),
+                                   "on_charger": bool(on_charger)}
+                if (level is not None and level <= 1 and not charging and not on_charger
+                        and not suppress and now - last_batt > 120):
+                    last_batt = now
+                    _REACTING.set()
+                    threading.Thread(target=_battery_low, daemon=True).start()
+            except Exception as exc:
+                print(f"[reflex] battery: {exc}")
 
 
 # --------------------------------------------------------------------------- #
-# HTTP server for wire-pod (/stt + /v1)
+# Live monitor dashboard (self-contained HTML, no external deps).
+# --------------------------------------------------------------------------- #
+DASHBOARD_HTML = r"""<!doctype html><html lang="vi"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Vector Brain Monitor</title>
+<style>
+:root{--bg:#0d1117;--card:#161b22;--bd:#30363d;--fg:#e6edf3;--mut:#8b949e;--grn:#3fb950;--red:#f85149;--yel:#d29922;--blu:#58a6ff;--pur:#bc8cff;--org:#ff9b50}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.45 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+header{display:flex;flex-wrap:wrap;gap:8px;align-items:center;padding:10px 14px;background:var(--card);border-bottom:1px solid var(--bd);position:sticky;top:0;z-index:5}
+header h1{font-size:15px;margin:0 8px 0 0}
+.pill{padding:3px 9px;border-radius:12px;border:1px solid var(--bd);font-size:12px;color:var(--mut);white-space:nowrap}
+.pill.on{color:var(--grn);border-color:var(--grn)}
+.pill.off{color:var(--red);border-color:var(--red)}
+.pill.warn{color:var(--yel);border-color:var(--yel)}
+.dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--red);margin-right:5px;vertical-align:middle}
+.dot.live{background:var(--grn)}
+.wrap{display:grid;grid-template-columns:1fr 1fr;gap:12px;padding:12px}
+@media(max-width:860px){.wrap{grid-template-columns:1fr}}
+.card{background:var(--card);border:1px solid var(--bd);border-radius:8px;padding:12px}
+.card h2{font-size:12px;text-transform:uppercase;letter-spacing:.6px;color:var(--mut);margin:0 0 10px}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(120px,1fr));gap:8px}
+.s{background:var(--bg);border:1px solid var(--bd);border-radius:6px;padding:8px}
+.s .k{font-size:11px;color:var(--mut)}
+.s .v{font-size:17px;font-weight:600;margin-top:2px;word-break:break-word}
+.v.g{color:var(--grn)}.v.r{color:var(--red)}.v.y{color:var(--yel)}.v.b{color:var(--blu)}.v.m{color:var(--mut)}
+.bar{height:6px;background:var(--bd);border-radius:3px;margin-top:6px;overflow:hidden}
+.bar>i{display:block;height:100%;background:var(--grn);transition:width .3s}
+.act .row{margin-bottom:10px}
+.act .lbl{font-size:11px;color:var(--mut)}
+.act .txt{font-size:15px;margin-top:2px;min-height:18px;word-break:break-word}
+.act .heard{color:var(--blu)}.act .said{color:var(--grn)}.act .react{color:var(--pur)}.act .auto{color:var(--yel)}
+.act .when{color:var(--mut);font-size:11px;font-weight:400}
+#logwrap{grid-column:1/-1}
+#toolbar{display:flex;flex-wrap:wrap;gap:12px;align-items:center;margin-bottom:8px;font-size:12px;color:var(--mut)}
+#toolbar label{cursor:pointer;user-select:none}
+#toolbar button{background:var(--bg);color:var(--fg);border:1px solid var(--bd);border-radius:5px;padding:3px 9px;cursor:pointer;font:inherit;font-size:12px}
+#log{height:44vh;overflow:auto;background:#010409;border:1px solid var(--bd);border-radius:6px;padding:8px;font-size:12.5px}
+.ln{padding:1px 2px;white-space:pre-wrap;word-break:break-word}
+.ln .t{color:#484f58;margin-right:6px}
+.tag-chat{color:var(--blu)}.tag-react{color:var(--pur)}.tag-auto{color:var(--yel)}.tag-tool{color:var(--grn)}.tag-reflex{color:var(--org)}.tag-stt{color:#79c0ff}.tag-sys{color:var(--mut)}.tag-sdk{color:#586069}.tag-err{color:var(--red);font-weight:600}
+</style></head><body>
+<header>
+  <h1>&#128054; Vector Brain Monitor</h1>
+  <span class="pill" id="p-body">body</span>
+  <span class="pill" id="p-model">model</span>
+  <span class="pill" id="p-mem">memory</span>
+  <span class="pill" id="p-auto">autonomous</span>
+  <span class="pill" id="p-prox">proximity</span>
+  <span class="pill" id="p-up">uptime</span>
+  <span style="margin-left:auto"><span class="dot" id="dot"></span><span id="upd" style="color:var(--mut)">connecting&#8230;</span></span>
+</header>
+<div class="wrap">
+  <div class="card"><h2>Sensors</h2><div class="grid" id="sensors"></div></div>
+  <div class="card act">
+    <h2>Brain activity</h2>
+    <div class="row"><div class="lbl">&#128066; Heard (STT) <span class="when" id="w-heard"></span></div><div class="txt heard" id="a-heard">&#8212;</div></div>
+    <div class="row"><div class="lbl">&#128172; Replied <span class="when" id="w-said"></span></div><div class="txt said" id="a-said">&#8212;</div></div>
+    <div class="row"><div class="lbl">&#9889; Reacted <span class="when" id="w-react"></span></div><div class="txt react" id="a-react">&#8212;</div></div>
+    <div class="row"><div class="lbl">&#129302; Autonomous <span class="when" id="w-auto"></span></div><div class="txt auto" id="a-auto">&#8212;</div></div>
+  </div>
+  <div class="card" id="logwrap">
+    <h2>Live log</h2>
+    <div id="toolbar">
+      <label><input type="checkbox" class="flt" value="chat" checked> chat</label>
+      <label><input type="checkbox" class="flt" value="stt" checked> stt</label>
+      <label><input type="checkbox" class="flt" value="react" checked> react</label>
+      <label><input type="checkbox" class="flt" value="auto" checked> auto</label>
+      <label><input type="checkbox" class="flt" value="tool" checked> tool</label>
+      <label><input type="checkbox" class="flt" value="reflex" checked> reflex</label>
+      <label><input type="checkbox" class="flt" value="sys" checked> sys</label>
+      <label><input type="checkbox" class="flt" value="sdk"> sdk</label>
+      <label><input type="checkbox" id="autoscroll" checked> autoscroll</label>
+      <button id="clr">clear</button>
+    </div>
+    <div id="log"></div>
+  </div>
+</div>
+<script>
+var $=function(i){return document.getElementById(i)};
+var lastSeq=0;
+function esc(s){return s.replace(/[&<>]/g,function(c){return{'&':'&amp;','<':'&lt;','>':'&gt;'}[c]})}
+function tagOf(l){
+  if(l.indexOf('[chat]')===0)return 'chat';
+  if(l.indexOf('[stt]')===0)return 'stt';
+  if(l.indexOf('[react]')===0)return 'react';
+  if(l.indexOf('[auto]')===0)return 'auto';
+  if(l.indexOf('[tool]')===0||l.indexOf('[act]')===0||l.indexOf('[speak]')===0)return 'tool';
+  if(l.indexOf('[reflex]')===0)return 'reflex';
+  if(l.indexOf('[brain]')===0||l.indexOf('[memory]')===0||l.indexOf('[body]')===0||l.indexOf('[curious]')===0)return 'sys';
+  if(/error|exception|traceback|fail|refused|broken pipe/i.test(l))return 'err';
+  return 'sdk';
+}
+function hhmmss(t){var d=new Date(t*1000);return d.toTimeString().slice(0,8)}
+function ago(s){if(s==null)return '';if(s<60)return Math.round(s)+'s ago';if(s<3600)return Math.round(s/60)+'m ago';return Math.round(s/3600)+'h ago'}
+function applyFilters(){
+  var f={};document.querySelectorAll('.flt').forEach(function(c){f[c.value]=c.checked});f.err=true;
+  document.querySelectorAll('#log .ln').forEach(function(d){d.style.display=f[d.dataset.tag]?'':'none'})
+}
+document.querySelectorAll('.flt').forEach(function(c){c.addEventListener('change',applyFilters)});
+$('clr').addEventListener('click',function(){$('log').innerHTML=''});
+
+function cell(k,v,cls,bar){
+  var b=bar!=null?'<div class="bar"><i style="width:'+bar+'%"></i></div>':'';
+  return '<div class="s"><div class="k">'+k+'</div><div class="v '+(cls||'')+'">'+v+'</div>'+b+'</div>'
+}
+function bool(v,goodIsTrue){
+  if(v===undefined||v===null)return cell('','',' ');
+  return v?'g':'r'
+}
+function renderSensors(s){
+  if(!s||s.body==='disabled'||Object.keys(s).length===0){
+    $('sensors').innerHTML='<div class="s"><div class="k">body</div><div class="v r">disconnected</div></div>';return
+  }
+  var h='';
+  var bl=s.battery_level;
+  h+=cell('battery',(bl==null?'?':bl)+' / 4'+(s.charging?' &#9889;':''),bl>=2?'g':bl>=1?'y':'r',bl!=null?Math.min(100,bl/4*100):0);
+  h+=cell('on charger',s.on_charger?'yes':'no',s.on_charger?'g':'m');
+  h+=cell('proximity',(s.proximity_mm==null?'?':s.proximity_mm+' mm'),s.proximity_mm!=null&&s.proximity_mm<70?'y':'b');
+  h+=cell('object ahead',s.object_ahead?'yes':'no',s.object_ahead?'y':'m');
+  h+=cell('being touched',s.being_touched?'YES':'no',s.being_touched?'g':'m');
+  h+=cell('held',s.being_held?'YES':'no',s.being_held?'y':'m');
+  h+=cell('picked up',s.picked_up?'YES':'no',s.picked_up?'y':'m');
+  h+=cell('button',s.button_pressed?'PRESSED':'no',s.button_pressed?'g':'m');
+  h+=cell('cliff',s.cliff_detected?'CLIFF!':'no',s.cliff_detected?'r':'m');
+  h+=cell('falling',s.falling?'YES':'no',s.falling?'r':'m');
+  h+=cell('moving',s.motors_moving?'yes':'no',s.motors_moving?'b':'m');
+  var fn=(s.face_names&&s.face_names.length)?(' ('+s.face_names.join(',')+')'):'';
+  h+=cell('faces',(s.faces_visible==null?'?':s.faces_visible)+fn,s.faces_visible>0?'g':'m');
+  h+=cell('pitch',(s.pitch_deg==null?'?':s.pitch_deg+'&deg;'),'b');
+  if(s.accel)h+=cell('accel z',s.accel[2],'m');
+  h+=cell('robot time',s.time||'?','m');
+  $('sensors').innerHTML=h
+}
+function setPill(id,txt,cls){var e=$(id);e.textContent=txt;e.className='pill '+(cls||'')}
+function act(elId,whenId,obj){
+  if(obj){$(elId).textContent=obj.line.replace(/^\[[a-z]+\]\s*/i,'');$(whenId).textContent=ago((Date.now()/1000)-obj.t)}
+}
+async function pollState(){
+  try{
+    var s=await (await fetch('/api/state',{cache:'no-store'})).json();
+    setPill('p-body',s.body_connected?'body: connected':'body: OFF',s.body_connected?'on':'off');
+    setPill('p-model','model: '+s.model,'');
+    setPill('p-mem','memory: '+(s.memory?'on':'off'),s.memory?'on':'warn');
+    setPill('p-auto','autonomous: '+(s.autonomous?'on':'off'),s.autonomous?'on':'warn');
+    setPill('p-prox','proximity: '+(s.proximity_reflex?'on':'off'),s.proximity_reflex?'on':'warn');
+    var up=s.uptime_s,us=up<3600?Math.round(up/60)+'m':(up/3600).toFixed(1)+'h';
+    setPill('p-up','uptime: '+us+(s.sense_age!=null?'  &middot; sense '+Math.round(s.sense_age)+'s':''),'');
+    renderSensors(s.sense);
+    act('a-heard','w-heard',s.heard);act('a-said','w-said',s.said);
+    act('a-react','w-react',s.react);act('a-auto','w-auto',s.auto);
+    $('dot').classList.add('live');$('upd').textContent='live &middot; '+new Date().toLocaleTimeString();
+    $('upd').innerHTML='live &middot; '+new Date().toLocaleTimeString();
+  }catch(e){$('dot').classList.remove('live');$('upd').textContent='disconnected, retrying&#8230;'}
+}
+async function pollLogs(){
+  try{
+    var d=await (await fetch('/api/logs?since='+lastSeq,{cache:'no-store'})).json();
+    lastSeq=d.next;
+    if(!d.lines.length)return;
+    var log=$('log');var f={};document.querySelectorAll('.flt').forEach(function(c){f[c.value]=c.checked});f.err=true;
+    var frag=document.createDocumentFragment();
+    d.lines.forEach(function(it){
+      var tag=tagOf(it.line);
+      var div=document.createElement('div');div.className='ln';div.dataset.tag=tag;
+      div.style.display=f[tag]?'':'none';
+      div.innerHTML='<span class="t">'+hhmmss(it.t)+'</span><span class="tag-'+tag+'">'+esc(it.line)+'</span>';
+      frag.appendChild(div)
+    });
+    log.appendChild(frag);
+    while(log.children.length>1200)log.removeChild(log.firstChild);
+    if($('autoscroll').checked)log.scrollTop=log.scrollHeight
+  }catch(e){}
+}
+pollState();pollLogs();
+setInterval(pollState,1000);
+setInterval(pollLogs,1000);
+</script></body></html>"""
+
+
+# --------------------------------------------------------------------------- #
+# HTTP server for wire-pod (/stt + /v1) + monitor dashboard
 # --------------------------------------------------------------------------- #
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *a):
@@ -997,11 +1316,57 @@ class Handler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionError):
             pass
 
+    def _html(self, body):
+        data = body.encode("utf-8")
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+        except (BrokenPipeError, ConnectionError):
+            pass
+
+    def _dash_state(self):
+        snap = _STATE.get("sense") or {}
+        now = time.time()
+
+        def ago(k):
+            ts = _STATE.get(k, 0)
+            return round(now - ts, 1) if ts else None
+        self._json(200, {
+            "ts": now, "uptime_s": round(now - BOOT, 1),
+            "body_connected": ROBOT is not None, "model": GPT.model,
+            "memory": MEMORY_ENABLED, "autonomous": AUTONOMOUS,
+            "convo_followup": CONVO_FOLLOWUP, "proximity_reflex": PROXIMITY_REFLEX,
+            "sense": snap if snap else ({"body": "disabled"} if ROBOT is None else {}),
+            "sense_age": ago("sense_ts"), "voice_active_ago": ago("voice_active"),
+            "heard": DASH.latest("[stt]", "[chat] user:"),
+            "said": DASH.latest("[chat] vector:"),
+            "react": DASH.latest("[react]"), "auto": DASH.latest("[auto]"),
+        })
+
+    def _dash_logs(self):
+        q = parse_qs(urlparse(self.path).query)
+        try:
+            since = int(q.get("since", ["0"])[0])
+        except Exception:
+            since = 0
+        nxt, lines = DASH.since(since)
+        self._json(200, {"next": nxt, "lines": lines})
+
     def do_GET(self):
-        if self.path.rstrip("/") in ("/health", "/healthz"):
+        path = urlparse(self.path).path.rstrip("/") or "/"
+        if path in ("/health", "/healthz"):
             self._json(200, {"ok": True, "model": GPT.model})
-        elif self.path.rstrip("/") == "/sense":
+        elif path == "/sense":
             self._json(200, ROBOT.sense() if ROBOT is not None else {"body": "disabled"})
+        elif path in ("/", "/dashboard"):
+            self._html(DASHBOARD_HTML)
+        elif path == "/api/state":
+            self._dash_state()
+        elif path == "/api/logs":
+            self._dash_logs()
         else:
             self._json(404, {"error": "not found"})
 

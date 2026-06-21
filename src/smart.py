@@ -274,18 +274,14 @@ class SmartVector:
             pass
         return touched, held, button
 
-    def sense(self) -> dict:
-        """Everything Vector can feel right now — handed to the LLM to judge."""
+    def fast_sense(self) -> dict:
+        """Everything in sense() EXCEPT the battery (`get_battery_state`) RPC — i.e.
+        ONLY cached event-stream reads (status flags, touch, proximity/found_object,
+        faces, accel/pitch). RPC-free, so the reflex loop can rebuild the live
+        snapshot at 10Hz without ever touching the SDK request path. This is what
+        keeps proximity/object_ahead/touch fresh even while a reaction is running."""
         r = self.robot
         s = {}
-        try:
-            bs = _wait(r.get_battery_state())
-            if bs:
-                s['battery_level'] = bs.battery_level            # 0..4
-                s['charging'] = bool(bs.is_charging)
-                s['on_charger'] = bool(bs.is_on_charger)
-        except Exception:
-            pass
         for k in ('is_being_held', 'is_picked_up', 'is_button_pressed',
                   'is_cliff_detected', 'is_falling', 'is_carrying_block',
                   'are_motors_moving'):
@@ -321,6 +317,24 @@ class SmartVector:
         except Exception:
             pass
         s['time'] = time.strftime('%H:%M')
+        return s
+
+    def sense(self) -> dict:
+        """Everything Vector can feel right now — handed to the LLM to judge. The
+        battery (an RPC) plus all the cached fast_sense() fields."""
+        s = {}
+        try:
+            bs = _wait(self.robot.get_battery_state())
+            if bs:
+                s['battery_level'] = bs.battery_level            # 0..4
+                s['charging'] = bool(bs.is_charging)
+                # SDK field is is_on_charger_platform (is_on_charger does NOT exist;
+                # the old name raised AttributeError mid-block -> on_charger never set
+                # -> dashboard always showed "no" even while docked).
+                s['on_charger'] = bool(bs.is_on_charger_platform)
+        except Exception:
+            pass
+        s.update(self.fast_sense())
         return s
 
     def motion(self) -> tuple:
@@ -377,11 +391,12 @@ class SmartVector:
             return False
 
     def battery(self) -> tuple:
-        """(level 0-3, is_charging, is_on_charger). RPC — call sparingly."""
+        """(level 0-4, is_charging, is_on_charger_platform). RPC — call sparingly."""
         try:
             bs = _wait(self.robot.get_battery_state())
             if bs:
-                return bs.battery_level, bool(bs.is_charging), bool(bs.is_on_charger)
+                return (bs.battery_level, bool(bs.is_charging),
+                        bool(bs.is_on_charger_platform))
         except Exception:
             pass
         return None, None, None
