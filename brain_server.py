@@ -854,7 +854,7 @@ def dog_tick(faces: int, on_charger) -> None:
     )
     try:
         r = GPT.client.chat.completions.create(
-            model=REACT_MODEL, max_completion_tokens=256, temperature=1.2,
+            model=REACT_MODEL, max_completion_tokens=256, temperature=1.0,
             **_reason(REACT_MODEL),
             messages=[{"role": "system", "content": _dog_sys()},
                       {"role": "user", "content": sit}])
