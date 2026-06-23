@@ -115,6 +115,16 @@ AUTO_MODEL = os.environ.get("VECTOR_AUTO_MODEL", "gpt-5.4-mini")
 # Richer model for sensor REACTIONS (pickup/flip/shake/petting) so they're lively
 # and surprising — not the bare cheap autonomous ticks.
 REACT_MODEL = os.environ.get("VECTOR_REACT_MODEL", "gpt-5.4-mini")
+
+
+def _reason(model):
+    """gpt-5.x models REASON by default, which makes a reaction take ~20s (esp. with
+    a camera frame) — far too slow to keep up while you play, so only the last one
+    ever lands. Ask for 'low' reasoning effort -> ~1-2s. Empty for non-gpt-5 models
+    (e.g. gpt-4o) which reject the parameter."""
+    return {"reasoning_effort": "low"} if str(model).startswith("gpt-5") else {}
+
+
 TOUCH_COOLDOWN = float(os.environ.get("VECTOR_TOUCH_COOLDOWN", "8"))
 VOICE_BACKOFF = float(os.environ.get("VECTOR_VOICE_BACKOFF", "10"))
 # Long-term memory subsystem (journal/dream/recall injected into context).
@@ -270,7 +280,7 @@ def _describe_scene(frame):
     try:
         url = CustomGPT._encode_image(frame)
         r = GPT.client.chat.completions.create(
-            model=AUTO_MODEL, max_completion_tokens=100,
+            model=AUTO_MODEL, max_completion_tokens=300, **_reason(AUTO_MODEL),
             messages=[{"role": "user", "content": [
                 {"type": "text", "text": "Briefly describe what this robot camera sees, in English."},
                 {"type": "image_url", "image_url": {"url": url}}]}])
@@ -617,14 +627,15 @@ LIGHT_SYS = (
 )
 
 
-def light_reply(situation: str, max_tokens: int = 60) -> str:
+def light_reply(situation: str, max_tokens: int = 256) -> str:
     """One cheap, STATELESS tick on the small model (low token cost, all-day)."""
     try:
         r = GPT.client.chat.completions.create(
             model=AUTO_MODEL,
             messages=[{"role": "system", "content": LIGHT_SYS},
                       {"role": "user", "content": situation}],
-            max_completion_tokens=max_tokens, temperature=1.0)
+            max_completion_tokens=max_tokens, temperature=1.0,
+            **_reason(AUTO_MODEL))
         return (r.choices[0].message.content or "@SILENT@").strip()
     except Exception as exc:
         print(f"[auto] light_reply failed: {exc}")
@@ -689,7 +700,8 @@ def react(situation: str, speak: bool = True, allow_move: bool = True) -> None:
         else:
             content = situation + extra
         r = GPT.client.chat.completions.create(
-            model=REACT_MODEL, max_completion_tokens=90, temperature=1.0,
+            model=REACT_MODEL, max_completion_tokens=256, temperature=1.0,
+            **_reason(REACT_MODEL),
             messages=[{"role": "system", "content": _react_sys()},
                       {"role": "user", "content": content}])
         return (r.choices[0].message.content or "").strip()
@@ -778,7 +790,7 @@ def curiosity_explore():
     try:
         url = CustomGPT._encode_image(frame)
         r = GPT.client.chat.completions.create(
-            model=AUTO_MODEL, max_completion_tokens=80,
+            model=AUTO_MODEL, max_completion_tokens=300, **_reason(AUTO_MODEL),
             messages=[{"role": "system", "content": LIGHT_SYS},
                       {"role": "user", "content": [
                 {"type": "text", "text":
@@ -842,7 +854,8 @@ def dog_tick(faces: int, on_charger) -> None:
     )
     try:
         r = GPT.client.chat.completions.create(
-            model=REACT_MODEL, max_completion_tokens=80, temperature=1.2,
+            model=REACT_MODEL, max_completion_tokens=256, temperature=1.2,
+            **_reason(REACT_MODEL),
             messages=[{"role": "system", "content": _dog_sys()},
                       {"role": "user", "content": sit}])
         reply = (r.choices[0].message.content or "@SILENT@").strip()
@@ -1583,7 +1596,7 @@ def _describe_person(frame) -> str:
     try:
         url = CustomGPT._encode_image(frame)
         r = GPT.client.chat.completions.create(
-            model=AUTO_MODEL, max_completion_tokens=120,
+            model=AUTO_MODEL, max_completion_tokens=300, **_reason(AUTO_MODEL),
             messages=[{"role": "user", "content": [
                 {"type": "text", "text": "Briefly describe the person in this image "
                  "(appearance, memorable features) in English, 1-2 sentences."},

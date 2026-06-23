@@ -195,7 +195,9 @@ class CustomGPT:
             for _ in range(4):
                 kwargs = dict(model=self.model, temperature=1.0, messages=call_messages)
                 if use_tools and self.tools:
-                    kwargs["tools"] = self.tools
+                    kwargs["tools"] = self.tools         # NOTE: tools + reasoning_effort
+                elif self.model.startswith("gpt-5"):     # is rejected on chat/completions
+                    kwargs["reasoning_effort"] = "low"   # so only ask for it when tool-free
                 chat = self.client.chat.completions.create(**kwargs)
                 msg = chat.choices[0].message
                 if getattr(msg, "tool_calls", None):
@@ -255,6 +257,8 @@ class CustomGPT:
             for _ in range(5):       # agentic loop: resolve tools, then stream words
                 kwargs = dict(model=self.model, temperature=1.0,
                               messages=call_messages, stream=True)
+                if self.model.startswith("gpt-5"):
+                    kwargs["reasoning_effort"] = "low"   # snappy voice (gpt-5.x reasons by default)
                 # NOTE: deliberately do NOT offer function-tools on the VOICE stream.
                 # wire-pod reads this SSE and speaks it; if the model spends the first
                 # round on tool_calls (no content), wire-pod sees an empty stream and
