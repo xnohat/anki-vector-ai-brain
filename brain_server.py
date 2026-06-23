@@ -975,6 +975,10 @@ def _run_reaction(situation, is_petting, near, picked, flipped, allow_move):
     for 'object_ahead / proximity stuck for a minute'). `_REACTING` is cleared when
     done so the next reaction can fire."""
     try:
+        # Grab control ONLY for the instant emote (to interrupt the firmware's own
+        # reaction), then RELEASE it. Holding OVERRIDE control through the LLM + TTS
+        # suppresses the backpack-button voice listening — so we must not hog it
+        # while you play. react() re-grabs control per action as needed.
         with ROBOT.control():
             if is_petting:
                 ROBOT.act("CUDDLE")
@@ -982,7 +986,7 @@ def _run_reaction(situation, is_petting, near, picked, flipped, allow_move):
                 ROBOT.emote("curious")     # something at his nose -> inquisitive
             else:
                 ROBOT.emote("surprised")   # instant, interrupts the native anim
-            react(situation, allow_move=allow_move)
+        react(situation, allow_move=allow_move)
     except Exception as exc:
         print(f"[reflex] {exc}")
     finally:
@@ -1228,6 +1232,11 @@ header h1{font-size:15px;margin:0 8px 0 0}
 <div id="ctrlbar" class="firmware">control…</div>
 <div class="wrap">
   <div class="card"><h2>Sensors</h2><div class="grid" id="sensors"></div></div>
+  <div class="card">
+    <h2>&#128247; Camera &#8212; what Vector sees</h2>
+    <img id="cam" alt="camera view" style="width:100%;border-radius:6px;background:#010409;display:block;min-height:140px;object-fit:contain">
+    <div id="camstat" style="font-size:11px;color:var(--mut);margin-top:6px">connecting&#8230;</div>
+  </div>
   <div class="card act">
     <h2>Brain activity</h2>
     <div class="row"><div class="lbl">&#128066; Heard (STT) <span class="when" id="w-heard"></span></div><div class="txt heard" id="a-heard">&#8212;</div></div>
@@ -1353,9 +1362,16 @@ async function pollLogs(){
     if($('autoscroll').checked)log.scrollTop=log.scrollHeight
   }catch(e){}
 }
-pollState();pollLogs();
+function pollCam(){
+  var t=new Image();
+  t.onload=function(){$('cam').src=t.src;$('camstat').textContent='live · '+new Date().toLocaleTimeString()};
+  t.onerror=function(){$('camstat').textContent='no camera (body disconnected?)'};
+  t.src='/api/frame.jpg?t='+Date.now();
+}
+pollState();pollLogs();pollCam();
 setInterval(pollState,1000);
 setInterval(pollLogs,1000);
+setInterval(pollCam,2000);
 </script></body></html>"""
 
 
@@ -1450,8 +1466,31 @@ class Handler(BaseHTTPRequestHandler):
             self._dash_state()
         elif path == "/api/logs":
             self._dash_logs()
+        elif path == "/api/frame.jpg":
+            self._frame_jpg()
         else:
             self._json(404, {"error": "not found"})
+
+    def _frame_jpg(self):
+        """Serve Vector's CURRENT camera view as JPEG — what he sees right now. The
+        feed is always running, and get_frame() is an RPC-free cached read, so the
+        dashboard can poll this every couple seconds for a live 'what Vector sees'."""
+        frame = ROBOT.get_frame() if ROBOT is not None else None
+        if frame is None:
+            self._json(503, {"error": "no camera"}); return
+        try:
+            data = _pil_to_jpeg(frame)
+        except Exception as exc:
+            self._json(500, {"error": str(exc)}); return
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "image/jpeg")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+        except (BrokenPipeError, ConnectionError):
+            pass
 
     def do_POST(self):
         if self.path.startswith("/stt"):
