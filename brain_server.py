@@ -654,16 +654,30 @@ def _react_sys() -> str:
 
 
 def react(situation: str, speak: bool = True, allow_move: bool = True) -> None:
-    """In-character reaction to a sensor event. STATELESS on purpose: it reacts
-    ONLY to the situation handed in, with no memory recall / chat-history — that
-    all-day context was bleeding past events (e.g. an old flip) into unrelated
-    reactions and making him babble about things that aren't happening. Full
-    context is for the voice conversation path only."""
+    """In-character reaction to a sensor event, GROUNDED in the present moment so it
+    isn't a generic, off-context line: (1) a live camera frame — he reacts to what
+    he can actually SEE while you play with him; (2) the last thing the two of you
+    just said, but ONLY if you were talking in the last ~90s (recent only — pulling
+    in all-day history used to make him babble about unrelated old events)."""
+    frame = ROBOT.get_frame() if ROBOT is not None else None
+    extra = ""
+    lc = _STATE.get("last_chat")
+    if lc and lc.get("u") and time.time() - lc.get("ts", 0) < 90:
+        extra = (f' (Moments ago your human said "{lc["u"]}" and you answered '
+                 f'"{lc["v"]}" — you are still in that moment together.)')
+    ask = (situation + extra + " React to what JUST happened, grounded in this very "
+           "moment and what you can SEE right now — be specific to it, never generic.")
     try:
+        if frame is not None:
+            content = [{"type": "text", "text": ask},
+                       {"type": "image_url",
+                        "image_url": {"url": CustomGPT._encode_image(frame)}}]
+        else:
+            content = ask
         r = GPT.client.chat.completions.create(
-            model=REACT_MODEL, max_tokens=90, temperature=1.1,
+            model=REACT_MODEL, max_tokens=90, temperature=1.0,
             messages=[{"role": "system", "content": _react_sys()},
-                      {"role": "user", "content": situation}])
+                      {"role": "user", "content": content}])
         reply = (r.choices[0].message.content or "").strip()
     except Exception as exc:
         print(f"[react] failed: {exc}")
@@ -1585,6 +1599,10 @@ def _maybe_meet_person(user_text: str) -> None:
 
 def _post_chat(user: str, spoken: str) -> None:
     """After a voice exchange: persist the chat thread + journal + learn people."""
+    # Remember the last exchange (regardless of long-term memory) so a sensor
+    # reaction moments later can stay in the same moment instead of firing a
+    # generic, off-context line.
+    _STATE["last_chat"] = {"u": user, "v": spoken, "ts": time.time()}
     if not MEMORY_ENABLED:
         return                       # dog mode: live in the moment, no journaling
     try:
