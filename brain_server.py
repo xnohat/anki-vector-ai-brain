@@ -332,6 +332,9 @@ def _run_action(token):
         return
     try:
         res = ROBOT.act(token)
+        # Log every action so the dashboard shows what actually ran vs got
+        # blocked (e.g. a move is refused while Vector is held / near a cliff).
+        print(f"[act] {token.strip()}{' — BLOCKED' if res is False else ''}")
     except Exception as exc:
         print(f"[act] {token} raised: {exc}")
         res = False
@@ -1231,11 +1234,10 @@ header h1{font-size:15px;margin:0 8px 0 0}
 </header>
 <div id="ctrlbar" class="firmware">control…</div>
 <div class="wrap">
-  <div class="card"><h2>Sensors</h2><div class="grid" id="sensors"></div></div>
   <div class="card">
-    <h2>&#128247; Camera &#8212; what Vector sees</h2>
-    <img id="cam" alt="camera view" style="width:100%;border-radius:6px;background:#010409;display:block;min-height:140px;object-fit:contain">
-    <div id="camstat" style="font-size:11px;color:var(--mut);margin-top:6px">connecting&#8230;</div>
+    <h2>Sensors <span id="camstat" style="float:right;font-weight:400;font-size:10px;color:var(--mut)">cam&#8230;</span></h2>
+    <img id="cam" alt="cam" title="what Vector sees" style="width:200px;max-width:100%;border-radius:6px;background:#010409;display:block;margin:0 0 10px">
+    <div class="grid" id="sensors"></div>
   </div>
   <div class="card act">
     <h2>Brain activity</h2>
