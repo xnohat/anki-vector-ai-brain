@@ -653,42 +653,63 @@ def _react_sys() -> str:
     return _REACT_SYS
 
 
+_REFUSAL = ("i'm sorry", "i am sorry", "i can't", "i cannot", "i can not",
+            "as an ai", "can't help", "cannot help", "can't assist", "i'm unable",
+            "i won't be able", "language model")
+
+
+# Framing that keeps the (vision) reaction model in character instead of refusing:
+# the image is Vector's OWN camera, he role-plays a toy dog reacting playfully and
+# must NOT identify/analyse the person — that "describe this person" reading is what
+# made gpt-4o answer "I'm sorry, I can't help with that."
+_VISION_REACT = (
+    " (The picture is the live view through your OWN camera — your eyes right now. "
+    "You are Vector, a tiny toy robot dog reacting in the moment. React playfully to "
+    "your human and your surroundings; do NOT describe, identify or analyse anyone — "
+    "just a short in-character dog reaction with feeling.)")
+
+
 def react(situation: str, speak: bool = True, allow_move: bool = True) -> None:
-    """In-character reaction to a sensor event, GROUNDED in the present moment so it
-    isn't a generic, off-context line: (1) a live camera frame — he reacts to what
-    he can actually SEE while you play with him; (2) the last thing the two of you
-    just said, but ONLY if you were talking in the last ~90s (recent only — pulling
-    in all-day history used to make him babble about unrelated old events)."""
-    frame = ROBOT.get_frame() if ROBOT is not None else None
+    """In-character reaction to a sensor event, grounded in the present moment:
+    (1) a live camera frame so he reacts to what he actually SEES while you play;
+    (2) the last thing you just said, but only if within ~90s (recent only). If the
+    vision call refuses ('I'm sorry…'), retry text-only — a refusal is NEVER spoken."""
     extra = ""
     lc = _STATE.get("last_chat")
     if lc and lc.get("u") and time.time() - lc.get("ts", 0) < 90:
         extra = (f' (Moments ago your human said "{lc["u"]}" and you answered '
-                 f'"{lc["v"]}" — you are still in that moment together.)')
-    ask = (situation + extra + " React to what JUST happened, grounded in this very "
-           "moment and what you can SEE right now — be specific to it, never generic.")
-    try:
-        if frame is not None:
-            content = [{"type": "text", "text": ask},
+                 f'"{lc["v"]}" — you are still in that same moment together.)')
+    frame = ROBOT.get_frame() if ROBOT is not None else None
+
+    def _ask(with_image):
+        if with_image and frame is not None:
+            content = [{"type": "text", "text": situation + extra + _VISION_REACT},
                        {"type": "image_url",
                         "image_url": {"url": CustomGPT._encode_image(frame)}}]
         else:
-            content = ask
+            content = situation + extra
         r = GPT.client.chat.completions.create(
             model=REACT_MODEL, max_tokens=90, temperature=1.0,
             messages=[{"role": "system", "content": _react_sys()},
                       {"role": "user", "content": content}])
-        reply = (r.choices[0].message.content or "").strip()
+        return (r.choices[0].message.content or "").strip()
+
+    try:
+        reply = _ask(with_image=True)
+        if not reply or any(p in reply.lower() for p in _REFUSAL):
+            print(f"[react] vision refused ({reply[:40]!r}); retry text-only")
+            reply = _ask(with_image=False)        # benign text -> won't refuse
     except Exception as exc:
         print(f"[react] failed: {exc}")
         return
-    if reply:
-        spoken = clean_spoken(reply)
-        if spoken:
-            print(f"[react] {spoken}")        # log NOW, before the blocking TTS
-        # playback (act_async waits for say_wav to finish, ~several seconds) — so
-        # the dashboard shows the reaction the moment it happens, not after it ends.
-        act_async(reply, speak_via_sdk=speak, allow_move=allow_move)
+    # Final backstop: never let an assistant refusal / meta-talk reach Vector's mouth.
+    if not reply or any(p in reply.lower() for p in _REFUSAL):
+        print(f"[react] (suppressed non-dog reply: {reply[:60]!r})")
+        return
+    spoken = clean_spoken(reply)
+    if spoken:
+        print(f"[react] {spoken}")        # log NOW, before the blocking TTS playback
+    act_async(reply, speak_via_sdk=speak, allow_move=allow_move)
 
 
 def _scene() -> str:
