@@ -669,9 +669,12 @@ def react(situation: str, speak: bool = True, allow_move: bool = True) -> None:
         print(f"[react] failed: {exc}")
         return
     if reply:
-        said = act_async(reply, speak_via_sdk=speak, allow_move=allow_move)
-        if said:
-            print(f"[react] {said}")
+        spoken = clean_spoken(reply)
+        if spoken:
+            print(f"[react] {spoken}")        # log NOW, before the blocking TTS
+        # playback (act_async waits for say_wav to finish, ~several seconds) — so
+        # the dashboard shows the reaction the moment it happens, not after it ends.
+        act_async(reply, speak_via_sdk=speak, allow_move=allow_move)
 
 
 def _scene() -> str:
@@ -813,11 +816,12 @@ def dog_tick(faces: int, on_charger) -> None:
         return
     # HARD RULE: never talk to an empty room. When alone he only does dog actions
     # (silent); he may speak only when his human is actually in front of him.
-    said = act_async(reply, speak_via_sdk=human, allow_move=(human and not on_charger))
-    if said:
-        _RECENT.append(said)
+    spoken = clean_spoken(reply)
+    if spoken:
+        print(f"[auto] {'spoke' if human else 'silent'}: {spoken}")   # log before TTS
+        _RECENT.append(spoken)
         del _RECENT[:-6]
-        print(f"[auto] {'spoke' if human else 'silent'}: {said}")
+    act_async(reply, speak_via_sdk=human, allow_move=(human and not on_charger))
 
 
 def greet_owner(snap: dict) -> None:
@@ -1133,6 +1137,11 @@ header h1{font-size:15px;margin:0 8px 0 0}
 .pill.warn{color:var(--yel);border-color:var(--yel)}
 .dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--red);margin-right:5px;vertical-align:middle}
 .dot.live{background:var(--grn)}
+#ctrlbar{padding:10px 14px;text-align:center;font-size:14px;font-weight:600;border-bottom:1px solid var(--bd);transition:background .15s,color .15s}
+#ctrlbar.brain{background:#0f2f1c;color:var(--grn)}
+#ctrlbar.react{background:#291a3a;color:var(--pur)}
+#ctrlbar.firmware{background:#15191f;color:var(--mut)}
+#ctrlbar.gone{background:#2a1416;color:var(--red)}
 .wrap{display:grid;grid-template-columns:1fr 1fr;gap:12px;padding:12px}
 @media(max-width:860px){.wrap{grid-template-columns:1fr}}
 .card{background:var(--card);border:1px solid var(--bd);border-radius:8px;padding:12px}
@@ -1168,6 +1177,7 @@ header h1{font-size:15px;margin:0 8px 0 0}
   <span class="pill" id="p-up">uptime</span>
   <span style="margin-left:auto"><span class="dot" id="dot"></span><span id="upd" style="color:var(--mut)">connecting&#8230;</span></span>
 </header>
+<div id="ctrlbar" class="firmware">control…</div>
 <div class="wrap">
   <div class="card"><h2>Sensors</h2><div class="grid" id="sensors"></div></div>
   <div class="card act">
@@ -1265,6 +1275,11 @@ async function pollState(){
     var up=s.uptime_s,us=up<3600?Math.round(up/60)+'m':(up/3600).toFixed(1)+'h';
     setPill('p-up','uptime: '+us+(s.sense_age!=null?'  &middot; sense '+Math.round(s.sense_age)+'s':''),'');
     renderSensors(s.sense);
+    var cb=$('ctrlbar'),o=s.control_owner;
+    if(o==='none'){cb.className='gone';cb.textContent='⚪ Body disconnected — brain has no SDK control';}
+    else if(o==='brain'){cb.className='brain';cb.textContent='🧠 BRAIN is controlling Vector (firmware freeplay suppressed)';}
+    else if(o==='reacting'){cb.className='react';cb.textContent='🧠 BRAIN reacting — thinking up a move…';}
+    else{cb.className='firmware';cb.textContent='🤖 Firmware freeplay — Vector on his own'+(s.last_action_ago!=null?' · brain last acted '+ago(s.last_action_ago):'');}
     act('a-heard','w-heard',s.heard);act('a-said','w-said',s.said);
     act('a-react','w-react',s.react);act('a-auto','w-auto',s.auto);
     $('dot').classList.add('live');$('upd').textContent='live &middot; '+new Date().toLocaleTimeString();
@@ -1323,6 +1338,7 @@ class Handler(BaseHTTPRequestHandler):
         try:
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Cache-Control", "no-store, must-revalidate")
             self.send_header("Content-Length", str(len(data)))
             self.end_headers()
             self.wfile.write(data)
@@ -1336,11 +1352,28 @@ class Handler(BaseHTTPRequestHandler):
         def ago(k):
             ts = _STATE.get(k, 0)
             return round(now - ts, 1) if ts else None
+        # Who is driving the body RIGHT NOW. The brain holds SDK OVERRIDE control
+        # (firmware freeplay suppressed) only briefly while acting, so report it
+        # "sticky" — still 'brain' for a couple seconds after release — otherwise
+        # sub-second grabs would be invisible between 1s dashboard polls.
+        held = bool(ROBOT is not None and ROBOT.has_control())
+        la = (now - ROBOT.last_action) if (ROBOT is not None and ROBOT.last_action) else None
+        if ROBOT is None:
+            owner = "none"
+        elif held or (la is not None and la < 2.5):
+            owner = "brain"          # driving the body now (or within the last 2.5s)
+        elif _REACTING.is_set():
+            owner = "reacting"       # busy thinking up a reaction (control not yet held)
+        else:
+            owner = "firmware"       # control released -> native firmware/freeplay
         self._json(200, {
             "ts": now, "uptime_s": round(now - BOOT, 1),
             "body_connected": ROBOT is not None, "model": GPT.model,
             "memory": MEMORY_ENABLED, "autonomous": AUTONOMOUS,
             "convo_followup": CONVO_FOLLOWUP, "proximity_reflex": PROXIMITY_REFLEX,
+            "control_owner": owner,
+            "brain_in_control": held, "reacting": _REACTING.is_set(),
+            "last_action_ago": round(la, 1) if la is not None else None,
             "sense": snap if snap else ({"body": "disabled"} if ROBOT is None else {}),
             "sense_age": ago("sense_ts"), "voice_active_ago": ago("voice_active"),
             "heard": DASH.latest("[stt]", "[chat] user:"),

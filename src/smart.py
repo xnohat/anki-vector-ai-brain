@@ -250,6 +250,12 @@ class SmartVector:
                     _wait(self.robot.conn.release_control(), timeout=8)
                     self.last_action = time.time()
 
+    def has_control(self) -> bool:
+        """True while the brain holds SDK behaviour control (OVERRIDE) — the brain
+        is driving the body and native firmware freeplay is suppressed. False means
+        control is released and the firmware/freeplay is in charge."""
+        return self._depth > 0
+
     # -------------------------------------------------------------- sensing
     def get_frame(self) -> PIL.Image.Image:
         try:
