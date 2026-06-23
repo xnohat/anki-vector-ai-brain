@@ -27,6 +27,12 @@ import anki_vector
 from anki_vector.connection import ControlPriorityLevel
 from anki_vector.util import degrees, distance_mm, speed_mmps
 
+# `object_ahead` should mean "something is genuinely CLOSE in front", not the raw
+# proximity found_object flag — that flag is ~always True because the ToF sensor
+# keeps seeing the table/floor at ~40cm, so it looked permanently "stuck on". Only
+# report object_ahead when the measured distance is under this (mm).
+OBJECT_AHEAD_MM = float(os.environ.get("VECTOR_OBJECT_AHEAD_MM", "120"))
+
 
 def _wait(x, timeout: float = 12.0):
     """Resolve an AsyncRobot future; swallow errors so one bad call can't crash us."""
@@ -298,8 +304,12 @@ class SmartVector:
         try:
             p = r.proximity.last_sensor_reading
             if p is not None and p.distance is not None:
-                s['proximity_mm'] = int(p.distance.distance_mm)
-                s['object_ahead'] = bool(p.found_object)
+                d = int(p.distance.distance_mm)
+                s['proximity_mm'] = d
+                # PURE distance (the raw found_object flag is ~always True because the
+                # ToF sensor keeps seeing the table/floor). object_ahead = something
+                # within OBJECT_AHEAD_MM — predictable, flips on distance alone.
+                s['object_ahead'] = bool(d < OBJECT_AHEAD_MM)
         except Exception:
             pass
         try:

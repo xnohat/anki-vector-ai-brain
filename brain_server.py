@@ -1069,13 +1069,15 @@ def reflex_loop():
                         "Someone is shaking you HARD — whoa, everything's a blur!"
                         if hard else "Someone is gently jiggling you about."), False
                 elif (PROXIMITY_REFLEX and near and not near_latched and not moving_now
-                      and not docked and now - ROBOT.last_action > 2.5):
+                      and not docked and now - ROBOT.last_action > 2.5
+                      and not _REACTING.is_set()):
                     near_latched = True          # boop once; re-arms after clear space
-                    fast = (prev_prox is not None and prev_prox - prox > 35)
-                    event, allow_move = (
-                        "A hand just darted right up to your face — almost a boop on the nose!"
-                        if fast else
-                        "Something has drifted right up close, hovering at your face."), False
+                    # SILENT acknowledgement only: flick curious eyes. NO spoken line
+                    # and NO LLM call, so the proximity boop makes no sound and never
+                    # shows the neural-net "thinking" face (that came from holding
+                    # control through the LLM/TTS reaction). Leave `event` unset so
+                    # the full _run_reaction path is skipped entirely.
+                    _bg(lambda: ROBOT.eye_color("curious"))
         prev_touch, prev_pick, prev_flipped, prev_near = touched, picked, flipped, near
         prev_prox = prox
 
