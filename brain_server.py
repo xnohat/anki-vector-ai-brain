@@ -1298,8 +1298,8 @@ function renderSensors(s){
   h+=cell('held',s.being_held?'YES':'no',s.being_held?'y':'m');
   h+=cell('picked up',s.picked_up?'YES':'no',s.picked_up?'y':'m');
   h+=cell('button',s.button_pressed?'PRESSED':'no',s.button_pressed?'g':'m');
-  h+=cell('cliff',s.cliff_detected?'CLIFF!':'no',s.cliff_detected?'r':'m');
-  h+=cell('falling',s.falling?'YES':'no',s.falling?'r':'m');
+  h+=cell('cliff / edge',s.cliff_detected?'EDGE!':'no',s.cliff_detected?'r':'m');
+  h+=cell('free-fall',s.falling?'FALLING!':'no',s.falling?'r':'m');
   h+=cell('moving',s.motors_moving?'yes':'no',s.motors_moving?'b':'m');
   var fn=(s.face_names&&s.face_names.length)?(' ('+s.face_names.join(',')+')'):'';
   h+=cell('faces',(s.faces_visible==null?'?':s.faces_visible)+fn,s.faces_visible>0?'g':'m');
