@@ -111,10 +111,10 @@ CONVO_END_WORDS = ("tạm biệt", "tam biet", "bye", "ngủ ngon", "ngu ngon",
                    "hẹn gặp", "hen gap", "chào nhé", "chao nhe", "gặp lại", "đi ngủ")
 # Cheap model for the constant autonomous/reflex ticks (runs all day) — keep it
 # small + stateless so token cost stays tiny. gpt-5.5 is only for voice chats.
-AUTO_MODEL = os.environ.get("VECTOR_AUTO_MODEL", "gpt-4o-mini")
+AUTO_MODEL = os.environ.get("VECTOR_AUTO_MODEL", "gpt-5.4-mini")
 # Richer model for sensor REACTIONS (pickup/flip/shake/petting) so they're lively
 # and surprising — not the bare cheap autonomous ticks.
-REACT_MODEL = os.environ.get("VECTOR_REACT_MODEL", "gpt-4o")
+REACT_MODEL = os.environ.get("VECTOR_REACT_MODEL", "gpt-5.4-mini")
 TOUCH_COOLDOWN = float(os.environ.get("VECTOR_TOUCH_COOLDOWN", "8"))
 VOICE_BACKOFF = float(os.environ.get("VECTOR_VOICE_BACKOFF", "10"))
 # Long-term memory subsystem (journal/dream/recall injected into context).
@@ -270,7 +270,7 @@ def _describe_scene(frame):
     try:
         url = CustomGPT._encode_image(frame)
         r = GPT.client.chat.completions.create(
-            model=AUTO_MODEL, max_tokens=100,
+            model=AUTO_MODEL, max_completion_tokens=100,
             messages=[{"role": "user", "content": [
                 {"type": "text", "text": "Briefly describe what this robot camera sees, in English."},
                 {"type": "image_url", "image_url": {"url": url}}]}])
@@ -624,7 +624,7 @@ def light_reply(situation: str, max_tokens: int = 60) -> str:
             model=AUTO_MODEL,
             messages=[{"role": "system", "content": LIGHT_SYS},
                       {"role": "user", "content": situation}],
-            max_tokens=max_tokens, temperature=1.0)
+            max_completion_tokens=max_tokens, temperature=1.0)
         return (r.choices[0].message.content or "@SILENT@").strip()
     except Exception as exc:
         print(f"[auto] light_reply failed: {exc}")
@@ -689,7 +689,7 @@ def react(situation: str, speak: bool = True, allow_move: bool = True) -> None:
         else:
             content = situation + extra
         r = GPT.client.chat.completions.create(
-            model=REACT_MODEL, max_tokens=90, temperature=1.0,
+            model=REACT_MODEL, max_completion_tokens=90, temperature=1.0,
             messages=[{"role": "system", "content": _react_sys()},
                       {"role": "user", "content": content}])
         return (r.choices[0].message.content or "").strip()
@@ -778,7 +778,7 @@ def curiosity_explore():
     try:
         url = CustomGPT._encode_image(frame)
         r = GPT.client.chat.completions.create(
-            model=AUTO_MODEL, max_tokens=80,
+            model=AUTO_MODEL, max_completion_tokens=80,
             messages=[{"role": "system", "content": LIGHT_SYS},
                       {"role": "user", "content": [
                 {"type": "text", "text":
@@ -842,7 +842,7 @@ def dog_tick(faces: int, on_charger) -> None:
     )
     try:
         r = GPT.client.chat.completions.create(
-            model=REACT_MODEL, max_tokens=80, temperature=1.2,
+            model=REACT_MODEL, max_completion_tokens=80, temperature=1.2,
             messages=[{"role": "system", "content": _dog_sys()},
                       {"role": "user", "content": sit}])
         reply = (r.choices[0].message.content or "@SILENT@").strip()
@@ -1583,7 +1583,7 @@ def _describe_person(frame) -> str:
     try:
         url = CustomGPT._encode_image(frame)
         r = GPT.client.chat.completions.create(
-            model=AUTO_MODEL, max_tokens=120,
+            model=AUTO_MODEL, max_completion_tokens=120,
             messages=[{"role": "user", "content": [
                 {"type": "text", "text": "Briefly describe the person in this image "
                  "(appearance, memorable features) in English, 1-2 sentences."},

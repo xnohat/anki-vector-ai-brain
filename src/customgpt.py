@@ -45,7 +45,7 @@ def _load_dotenv(path: str = ".env") -> None:
 _load_dotenv()
 
 # The brain model. Override with VECTOR_GPT_MODEL if needed.
-DEFAULT_MODEL = os.environ.get("VECTOR_GPT_MODEL", "gpt-5.5")
+DEFAULT_MODEL = os.environ.get("VECTOR_GPT_MODEL", "gpt-5.4-mini")
 
 # Language Vector speaks in. Default Vietnamese. Override with VECTOR_LANG.
 SPEAK_LANG = os.environ.get("VECTOR_LANG", "Vietnamese")
